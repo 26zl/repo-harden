@@ -16,8 +16,7 @@ import (
 // controlRulesetName is the name of the ruleset this tool manages.
 const controlRulesetName = "repo-harden"
 
-// codeScanningFreshness is how recent a code-scanning analysis must be to count
-// as "still scanning" (a stale one-off analysis does not prove scanning runs).
+// codeScanningFreshness is how recent an analysis must be to count as still scanning.
 const codeScanningFreshness = 90 * 24 * time.Hour
 
 type ControlStatus string
@@ -25,11 +24,11 @@ type ControlStatus string
 const (
 	StatusCompliant ControlStatus = "compliant" // already meets the baseline
 	StatusGap       ControlStatus = "gap"       // does not meet it; fixable by Apply
-	StatusSkipped   ControlStatus = "skipped"   // unavailable (e.g. needs a paid license)
+	StatusSkipped   ControlStatus = "skipped"   // unavailable, e.g. needs a paid license
 	StatusError     ControlStatus = "error"     // detection failed
 )
 
-// DetectResult is what a control reports for one repo; Prior lets Revert restore the old value.
+// DetectResult is what a control reports for one repo. Prior lets Revert put the old value back.
 type DetectResult struct {
 	Status ControlStatus
 	Prior  string
@@ -47,7 +46,7 @@ type Control struct {
 	Revert      func(ctx context.Context, c *github.Client, owner, name, prior string) error
 }
 
-// baseline holds the hardening control set, registered by the init() blocks below.
+// baseline holds all the controls. the init() blocks below register them.
 var baseline []Control
 
 // selectControls applies --only / --skip (comma-separated keys) to the baseline.
@@ -106,9 +105,8 @@ func encodePrior(v any) string {
 	return string(b)
 }
 
-// managedRulesetValid reports whether rs is an active branch ruleset covering the
-// default branch that carries the exact protections harden applies (so it counts
-// as already compliant). It validates parameter strength, not just rule presence.
+// managedRulesetValid checks rs is an active branch ruleset on the default branch
+// with the exact protections harden applies. checks the values, not just that rules exist.
 func managedRulesetValid(rs *github.RepositoryRuleset, branch string) bool {
 	if rs == nil || rs.Rules == nil || rs.Enforcement != github.RulesetEnforcementActive {
 		return false
@@ -141,6 +139,15 @@ func endpointUnavailable(err error) bool {
 	default:
 		return false
 	}
+}
+
+// detectErr returns Skipped when the endpoint is just unavailable (no admin access
+// or feature off) instead of a real failure, so collaborator repos stay quiet.
+func detectErr(err error) DetectResult {
+	if endpointUnavailable(err) {
+		return DetectResult{Status: StatusSkipped, Detail: "unavailable (needs admin access, or feature is off)"}
+	}
+	return DetectResult{Status: StatusError, Detail: err.Error()}
 }
 
 type workflowPermissionPrior struct {
@@ -204,7 +211,7 @@ func init() {
 		Detect: func(ctx context.Context, c *github.Client, owner, name string, _ *github.Repository) DetectResult {
 			on, _, err := c.Repositories.GetVulnerabilityAlerts(ctx, owner, name)
 			if err != nil {
-				return DetectResult{Status: StatusError, Detail: err.Error()}
+				return detectErr(err)
 			}
 			if on {
 				return DetectResult{Status: StatusCompliant, Prior: "enabled"}
@@ -216,7 +223,7 @@ func init() {
 			return err
 		},
 		Revert: func(ctx context.Context, c *github.Client, owner, name, prior string) error {
-			if prior == "enabled" { // it was already on; nothing we changed
+			if prior == "enabled" { // was already on, didn't touch it
 				return nil
 			}
 			_, err := c.Repositories.DisableVulnerabilityAlerts(ctx, owner, name)
@@ -235,7 +242,7 @@ func init() {
 			Detect: func(ctx context.Context, c *github.Client, owner, name string, _ *github.Repository) DetectResult {
 				f, _, err := c.Repositories.GetAutomatedSecurityFixes(ctx, owner, name)
 				if err != nil {
-					return DetectResult{Status: StatusError, Detail: err.Error()}
+					return detectErr(err)
 				}
 				if f.GetEnabled() {
 					return DetectResult{Status: StatusCompliant, Prior: "enabled"}
@@ -262,7 +269,7 @@ func init() {
 			Detect: func(ctx context.Context, c *github.Client, owner, name string, _ *github.Repository) DetectResult {
 				p, _, err := c.Repositories.GetDefaultWorkflowPermissions(ctx, owner, name)
 				if err != nil {
-					return DetectResult{Status: StatusError, Detail: err.Error()}
+					return detectErr(err)
 				}
 				prior := workflowPermissionPrior{
 					Default:    p.GetDefaultWorkflowPermissions(),
@@ -306,10 +313,10 @@ func init() {
 		Detect: func(ctx context.Context, c *github.Client, owner, name string, _ *github.Repository) DetectResult {
 			p, _, err := c.Repositories.GetActionsPermissions(ctx, owner, name)
 			if err != nil {
-				return DetectResult{Status: StatusError, Detail: err.Error()}
+				return detectErr(err)
 			}
 			if !p.GetEnabled() {
-				// Actions are disabled for this repo; do not silently enable them.
+				// actions are off for this repo, don't silently turn them on.
 				return DetectResult{Status: StatusSkipped, Detail: "Actions disabled for this repository"}
 			}
 			prior := actionsAllowlistPrior{Enabled: p.Enabled, AllowedActions: p.GetAllowedActions()}
@@ -318,7 +325,7 @@ func init() {
 			}
 			allowed, _, err := c.Repositories.GetActionsAllowed(ctx, owner, name)
 			if err != nil {
-				return DetectResult{Status: StatusError, Detail: err.Error()}
+				return detectErr(err)
 			}
 			prior.GithubOwnedAllowed = allowed.GithubOwnedAllowed
 			prior.VerifiedAllowed = allowed.VerifiedAllowed
@@ -379,7 +386,7 @@ func init() {
 		Detect: func(ctx context.Context, c *github.Client, owner, name string, repo *github.Repository) DetectResult {
 			sets, _, err := c.Repositories.GetAllRulesets(ctx, owner, name, nil)
 			if err != nil {
-				return DetectResult{Status: StatusError, Detail: err.Error()}
+				return detectErr(err)
 			}
 			for _, rs := range sets {
 				if rs.Name != controlRulesetName {
@@ -387,13 +394,13 @@ func init() {
 				}
 				full, _, err := c.Repositories.GetRuleset(ctx, owner, name, rs.GetID(), false)
 				if err != nil {
-					return DetectResult{Status: StatusError, Detail: err.Error()}
+					return detectErr(err)
 				}
 				if managedRulesetValid(full, repo.GetDefaultBranch()) {
 					return DetectResult{Status: StatusCompliant}
 				}
-				// Present but not a valid managed ruleset (may be the user's own). Capture it
-				// so revert can restore it after harden replaces it.
+				// there but not a valid managed ruleset (could be the user's own). grab it
+				// so revert can put it back after harden replaces it.
 				return DetectResult{Status: StatusGap, Prior: encodePrior(full), Detail: "ruleset named " + controlRulesetName + " is incomplete or inactive"}
 			}
 			return DetectResult{Status: StatusGap, Detail: "managed ruleset missing"}
@@ -417,8 +424,8 @@ func init() {
 					RequiredLinearHistory: &github.EmptyRuleParameters{},
 				},
 			}
-			// Update our managed ruleset in place if a same-name ruleset exists (atomic; no
-			// delete/create gap); otherwise create it. Detect captured the prior so revert restores it.
+			// if a same-name ruleset exists, update in place (no delete/create gap),
+			// otherwise create it. detect already grabbed the prior for revert.
 			if sets, _, err := c.Repositories.GetAllRulesets(ctx, owner, name, nil); err == nil {
 				for _, rs := range sets {
 					if rs.Name == controlRulesetName {
@@ -445,7 +452,7 @@ func init() {
 			if id < 0 {
 				return nil // nothing of ours to undo
 			}
-			// If harden replaced a pre-existing same-name ruleset, restore it in place; else delete ours.
+			// if harden replaced an existing same-name ruleset, put it back; else delete ours.
 			if strings.TrimSpace(prior) != "" {
 				var captured github.RepositoryRuleset
 				if err := json.Unmarshal([]byte(prior), &captured); err == nil && captured.Name != "" {
@@ -478,7 +485,7 @@ func init() {
 			Detect: func(ctx context.Context, c *github.Client, owner, name string, repo *github.Repository) DetectResult {
 				full, _, err := c.Repositories.Get(ctx, owner, name)
 				if err != nil {
-					return DetectResult{Status: StatusError, Detail: err.Error()}
+					return detectErr(err)
 				}
 				sa := full.GetSecurityAndAnalysis()
 				secretStatus := sa.GetSecretScanning().GetStatus()
@@ -534,15 +541,14 @@ func init() {
 					if repo.GetPrivate() && endpointUnavailable(err) {
 						return DetectResult{Status: StatusSkipped, Detail: "private repo - requires Code Security/Advanced Security availability"}
 					}
-					return DetectResult{Status: StatusError, Detail: err.Error()}
+					return detectErr(err)
 				}
 				if cfg.GetState() == "configured" {
 					return DetectResult{Status: StatusCompliant, Prior: "configured"}
 				}
-				// Default setup is off, but an advanced/workflow-based CodeQL setup may already
-				// scan the default branch. Only treat that as compliant when a RECENT analysis
-				// exists (a stale one-off does not prove scanning still runs); enabling default
-				// setup would disrupt a real advanced setup.
+				// default setup is off, but an advanced/workflow CodeQL setup might already
+				// scan the default branch. only count it compliant if there's a recent analysis,
+				// since turning on default setup would break a real advanced setup.
 				ref := "refs/heads/" + repo.GetDefaultBranch()
 				analyses, _, aerr := c.CodeScanning.ListAnalysesForRepo(ctx, owner, name,
 					&github.AnalysesListOptions{Ref: github.Ptr(ref), ListOptions: github.ListOptions{PerPage: 1}})
@@ -571,7 +577,7 @@ func init() {
 	)
 }
 
-// fileExists returns true if any path exists; a non-404 error is returned, not swallowed.
+// fileExists returns true if any of the paths exist. non-404 errors bubble up.
 func fileExists(ctx context.Context, c *github.Client, owner, name string, paths ...string) (bool, error) {
 	for _, p := range paths {
 		file, _, _, err := c.Repositories.GetContents(ctx, owner, name, p, nil)
@@ -595,7 +601,7 @@ func init() {
 			Detect: func(ctx context.Context, c *github.Client, owner, name string, _ *github.Repository) DetectResult {
 				ok, err := fileExists(ctx, c, owner, name, "SECURITY.md", ".github/SECURITY.md", "docs/SECURITY.md")
 				if err != nil {
-					return DetectResult{Status: StatusError, Detail: err.Error()}
+					return detectErr(err)
 				}
 				if ok {
 					return DetectResult{Status: StatusCompliant}
@@ -611,7 +617,7 @@ func init() {
 			Detect: func(ctx context.Context, c *github.Client, owner, name string, _ *github.Repository) DetectResult {
 				ok, err := fileExists(ctx, c, owner, name, ".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
 				if err != nil {
-					return DetectResult{Status: StatusError, Detail: err.Error()}
+					return detectErr(err)
 				}
 				if ok {
 					return DetectResult{Status: StatusCompliant}
@@ -622,7 +628,40 @@ func init() {
 	)
 }
 
-// cmdControls lists the baseline controls: which are auto-fixable and which can be reverted.
+func init() {
+	baseline = append(baseline, Control{
+		Key:         "private-vulnerability-reporting",
+		Title:       "Private vulnerability reporting enabled",
+		Severity:    "medium",
+		Remediation: "Enable private vulnerability reporting so researchers can report issues privately instead of in public issues.",
+		Detect: func(ctx context.Context, c *github.Client, owner, name string, _ *github.Repository) DetectResult {
+			on, _, err := c.Repositories.IsPrivateReportingEnabled(ctx, owner, name)
+			if err != nil {
+				if endpointUnavailable(err) {
+					return DetectResult{Status: StatusSkipped, Detail: "private vulnerability reporting unavailable for this repo"}
+				}
+				return detectErr(err)
+			}
+			if on {
+				return DetectResult{Status: StatusCompliant, Prior: "enabled"}
+			}
+			return DetectResult{Status: StatusGap, Prior: "disabled"}
+		},
+		Apply: func(ctx context.Context, c *github.Client, owner, name string) error {
+			_, err := c.Repositories.EnablePrivateReporting(ctx, owner, name)
+			return err
+		},
+		Revert: func(ctx context.Context, c *github.Client, owner, name, prior string) error {
+			if prior == "enabled" {
+				return nil
+			}
+			_, err := c.Repositories.DisablePrivateReporting(ctx, owner, name)
+			return err
+		},
+	})
+}
+
+// cmdControls lists the baseline controls and whether they're auto-fixable/revertable.
 func cmdControls(o *opts) error {
 	fmt.Println(colorize(o, colorGo, "repo-harden baseline controls"))
 	fmt.Printf("%-22s %-9s %-12s %s\n", "KEY", "SEVERITY", "ACTION", "REVERSIBLE")

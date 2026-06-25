@@ -33,7 +33,7 @@ func (r *hardenRecorder) record(e HardenEntry) (bool, error) {
 	key := e.Repo + "\x00" + e.Control
 	for i, existing := range r.entries {
 		if existing.Repo+"\x00"+existing.Control == key {
-			// refresh the prior so revert restores the latest pre-change value
+			// update prior so revert uses the latest pre-change value
 			if existing.Prior == e.Prior {
 				return true, nil
 			}
@@ -54,7 +54,7 @@ func (r *hardenRecorder) record(e HardenEntry) (bool, error) {
 	return true, nil
 }
 
-// remove drops a recorded entry, e.g. after its Apply failed.
+// remove drops a recorded entry, e.g. after Apply fails.
 func (r *hardenRecorder) remove(e HardenEntry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -62,7 +62,11 @@ func (r *hardenRecorder) remove(e HardenEntry) {
 	for i, existing := range r.entries {
 		if existing.Repo+"\x00"+existing.Control == key {
 			r.entries = append(r.entries[:i], r.entries[i+1:]...)
-			_ = saveHardenState(r.path, r.entries)
+			if err := saveHardenState(r.path, r.entries); err != nil {
+				// if this didn't save, state still has an entry for a change that
+				// never applied; warn so a later revert doesn't act on it.
+				fmt.Fprintf(os.Stderr, "warn: could not update state after rolling back %s on %s: %v\n", e.Control, e.Repo, err)
+			}
 			return
 		}
 	}
@@ -81,12 +85,12 @@ func collectHarden(ctx context.Context, c *github.Client, o *opts, repos []*gith
 		g.Go(func() error {
 			owner, name := splitRepo(r.GetFullName())
 			for _, ctl := range controls {
-				if ctl.Apply == nil { // report-only control
+				if ctl.Apply == nil { // report-only, skip
 					continue
 				}
 				res := ctl.Detect(gctx, c, owner, name, r)
 				switch res.Status {
-				case StatusCompliant: // idempotent: nothing to do, not a change
+				case StatusCompliant: // already good, nothing to do
 					continue
 				case StatusSkipped:
 					mu.Lock()
@@ -124,7 +128,7 @@ func collectHarden(ctx context.Context, c *github.Client, o *opts, repos []*gith
 					continue
 				}
 				if err := ctl.Apply(gctx, c, owner, name); err != nil {
-					recorder.remove(entry) // roll back the recorded entry on apply failure
+					recorder.remove(entry) // apply failed, drop the entry
 					mu.Lock()
 					failed++
 					fmt.Fprintf(os.Stderr, "  %s %s :: %s: %v\n", actionLabel(o, "FAILED"), r.GetFullName(), ctl.Key, err)
@@ -178,7 +182,7 @@ func cmdHarden(ctx context.Context, c *github.Client, o *opts) error {
 	return nil
 }
 
-// scopeEntries splits entries by --only/--skip into revert and keep.
+// scopeEntries splits entries into revert/keep by --only/--skip.
 func scopeEntries(entries []HardenEntry, only, skip string) (toRevert, kept []HardenEntry) {
 	onlySet := splitSet(only)
 	skipSet := splitSet(skip)
@@ -200,7 +204,7 @@ func controlMap() map[string]Control {
 	return m
 }
 
-// revertEntries reverts each entry; returns the entries that still failed (to re-save).
+// revertEntries reverts each entry; returns the ones that failed so we can re-save them.
 func revertEntries(ctx context.Context, c *github.Client, o *opts, entries []HardenEntry) []HardenEntry {
 	cm := controlMap()
 	var mu sync.Mutex
@@ -235,7 +239,7 @@ func revertEntries(ctx context.Context, c *github.Client, o *opts, entries []Har
 			return nil
 		})
 	}
-	_ = g.Wait() // goroutines never error; failures tracked in remaining
+	_ = g.Wait() // goroutines never error, failures go in remaining
 
 	return remaining
 }

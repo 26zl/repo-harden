@@ -21,9 +21,9 @@ type restClient struct {
 }
 
 func newRestClient(provider string, o *opts) (*restClient, error) {
-	token := strings.TrimSpace(o.token)
-	if token == "" {
-		token = tokenFromEnv(provider)
+	token, err := resolveToken(o, o.host, provider)
+	if err != nil {
+		return nil, err
 	}
 	if token == "" {
 		return nil, fmt.Errorf("no %s token found for %s", provider, o.host)
@@ -47,17 +47,8 @@ func newRestClient(provider string, o *opts) (*restClient, error) {
 		header:  header,
 		prefix:  prefix,
 		client: &http.Client{
-			Timeout: 30 * time.Second,
-			// don't follow a redirect to another host — it would leak the token
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				if len(via) > 0 && req.URL.Host != via[0].URL.Host {
-					return fmt.Errorf("refusing cross-host redirect to %s", req.URL.Host)
-				}
-				if len(via) >= 10 {
-					return fmt.Errorf("stopped after 10 redirects")
-				}
-				return nil
-			},
+			Timeout:       30 * time.Second,
+			CheckRedirect: noCrossHostRedirect,
 		},
 	}, nil
 }
@@ -129,7 +120,7 @@ func httpUnavailable(err error) bool {
 	return false
 }
 
-// requireSecureURL rejects sending a token in cleartext over http to a non-loopback host.
+// don't send a token over plain http unless it's loopback
 func requireSecureURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -137,9 +128,9 @@ func requireSecureURL(raw string) error {
 	}
 	if u.Scheme == "http" {
 		switch u.Hostname() {
-		case "localhost", "127.0.0.1", "::1", "":
+		case "localhost", "127.0.0.1", "::1":
 		default:
-			return fmt.Errorf("refusing to send token over cleartext http to %s; use https", u.Host)
+			return fmt.Errorf("refusing to send token over cleartext http to %q; use https", u.Host)
 		}
 	}
 	return nil
@@ -177,36 +168,56 @@ func collectGitLabAudit(ctx context.Context, o *opts) ([]auditRow, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
+	want := wantFunc(o)
 	var rows []auditRow
-	rows = append(rows, providerRow("gitlab", "token", "authenticated-token", "token-scopes", "Token scopes are least privilege", "medium", StatusSkipped, "GitLab token scopes are not exposed by this API", "Use a least-privilege project/group access token."))
+	if want("token-scopes") {
+		rows = append(rows, providerRow("gitlab", "token", "authenticated-token", "token-scopes", "Token scopes are least privilege", "medium", StatusSkipped, "GitLab token scopes are not exposed by this API", "Use a least-privilege project/group access token."))
+	}
 	for _, p := range projects {
+		p := p
 		target := p.PathWithNamespace
-		rows = append(rows, auditGenericVisibility("gitlab", target, p.Visibility == "public"))
-		rows = append(rows, auditGenericStale("gitlab", target, p.LastActivityAt, o.staleDays))
-		if p.DefaultBranch == "" {
-			rows = append(rows, providerRow("gitlab", "repo", target, "default-branch", "Default branch is set", "medium", StatusGap, "no default branch", "Set a default branch and protect it."))
-		} else {
-			rows = append(rows, providerRow("gitlab", "repo", target, "default-branch", "Default branch is set", "medium", StatusCompliant, "default branch: "+p.DefaultBranch, "Set a default branch and protect it."))
+		checks := []struct {
+			key string
+			run func() auditRow
+		}{
+			{"public-exposure", func() auditRow { return auditGenericVisibility("gitlab", target, p.Visibility == "public") }},
+			{"stale-repo", func() auditRow { return auditGenericStale("gitlab", target, p.LastActivityAt, o.staleDays) }},
+			{"default-branch", func() auditRow { return gitlabDefaultBranchRow(p) }},
+			{"branch-protection-full", func() auditRow { return auditGitLabBranchProtection(ctx, client, p) }},
+			{"signed-commits", func() auditRow { return auditGitLabSignedCommits(ctx, client, p) }},
+			{"required-workflows", func() auditRow { return auditGitLabRequiredWorkflows(ctx, client, p) }},
+			{"environment-protection", func() auditRow { return auditGitLabEnvironments(ctx, client, p) }},
+			{"repo-secrets", func() auditRow { return auditGitLabVariables(ctx, client, p) }},
+			{"deploy-keys", func() auditRow { return auditGitLabDeployKeys(ctx, client, p) }},
+			{"webhooks", func() auditRow { return auditGitLabWebhooks(ctx, client, p) }},
+			{"collaborators", func() auditRow { return auditGitLabCollaborators(ctx, client, p) }},
+			{"vulnerability-alert-count", func() auditRow { return auditGitLabVulnerabilities(ctx, client, p) }},
+			{"releases", func() auditRow { return auditGitLabReleases(ctx, client, p) }},
+			{"packages", func() auditRow { return auditGitLabPackages(ctx, client, p) }},
+			{"dependency-sbom", func() auditRow { return auditGitLabDependencies(ctx, client, p) }},
+			{"archived-active-risk", func() auditRow { return gitlabArchivedRow(p) }},
 		}
-		rows = append(rows, auditGitLabBranchProtection(ctx, client, p))
-		rows = append(rows, auditGitLabSignedCommits(ctx, client, p))
-		rows = append(rows, auditGitLabRequiredWorkflows(ctx, client, p))
-		rows = append(rows, auditGitLabEnvironments(ctx, client, p))
-		rows = append(rows, auditGitLabVariables(ctx, client, p))
-		rows = append(rows, auditGitLabDeployKeys(ctx, client, p))
-		rows = append(rows, auditGitLabWebhooks(ctx, client, p))
-		rows = append(rows, auditGitLabCollaborators(ctx, client, p))
-		rows = append(rows, auditGitLabVulnerabilities(ctx, client, p))
-		rows = append(rows, auditGitLabReleases(ctx, client, p))
-		rows = append(rows, auditGitLabPackages(ctx, client, p))
-		rows = append(rows, auditGitLabDependencies(ctx, client, p))
-		if p.Archived {
-			rows = append(rows, providerRow("gitlab", "repo", target, "archived-active-risk", "Archived repositories are reviewed", "low", StatusGap, "archived project included in audit", "Disable schedules/tokens/webhooks before archiving."))
-		} else {
-			rows = append(rows, providerRow("gitlab", "repo", target, "archived-active-risk", "Archived repositories are reviewed", "low", StatusCompliant, "project is not archived", "Disable schedules/tokens/webhooks before archiving."))
+		for _, ch := range checks {
+			if want(ch.key) {
+				rows = append(rows, ch.run())
+			}
 		}
 	}
 	return rows, len(projects), nil
+}
+
+func gitlabDefaultBranchRow(p gitlabProject) auditRow {
+	if p.DefaultBranch == "" {
+		return providerRow("gitlab", "repo", p.PathWithNamespace, "default-branch", "Default branch is set", "medium", StatusGap, "no default branch", "Set a default branch and protect it.")
+	}
+	return providerRow("gitlab", "repo", p.PathWithNamespace, "default-branch", "Default branch is set", "medium", StatusCompliant, "default branch: "+p.DefaultBranch, "Set a default branch and protect it.")
+}
+
+func gitlabArchivedRow(p gitlabProject) auditRow {
+	if p.Archived {
+		return providerRow("gitlab", "repo", p.PathWithNamespace, "archived-active-risk", "Archived repositories are reviewed", "low", StatusGap, "archived project included in audit", "Disable schedules/tokens/webhooks before archiving.")
+	}
+	return providerRow("gitlab", "repo", p.PathWithNamespace, "archived-active-risk", "Archived repositories are reviewed", "low", StatusCompliant, "project is not archived", "Disable schedules/tokens/webhooks before archiving.")
 }
 
 func listGitLabProjects(ctx context.Context, c *restClient, o *opts) ([]gitlabProject, error) {
@@ -332,36 +343,84 @@ func auditGitLabEnvironments(ctx context.Context, c *restClient, p gitlabProject
 }
 
 func auditGitLabVariables(ctx context.Context, c *restClient, p gitlabProject) auditRow {
-	var vars []struct {
-		Key       string `json:"key"`
-		Protected bool   `json:"protected"`
-		Masked    bool   `json:"masked"`
-	}
-	_, err := c.get(ctx, gitlabProjectPath(p, "/variables"), url.Values{"per_page": []string{"100"}}, &vars)
-	if err != nil {
-		if httpUnavailable(err) {
-			return providerRow("gitlab", "repo", p.PathWithNamespace, "repo-secrets", "CI variables are protected and masked", "medium", StatusSkipped, "CI variables API unavailable", "Protect and mask CI/CD variables where possible.")
-		}
-		return providerRow("gitlab", "repo", p.PathWithNamespace, "repo-secrets", "CI variables are protected and masked", "medium", StatusError, err.Error(), "Protect and mask CI/CD variables where possible.")
-	}
+	const rem = "Protect and mask CI/CD variables where possible."
 	var weak []string
-	for _, v := range vars {
-		if !v.Protected || !v.Masked {
-			weak = append(weak, v.Key)
+	total, page := 0, 1
+	for {
+		var vars []struct {
+			Key       string `json:"key"`
+			Protected bool   `json:"protected"`
+			Masked    bool   `json:"masked"`
 		}
+		resp, err := c.get(ctx, gitlabProjectPath(p, "/variables"),
+			url.Values{"per_page": []string{"100"}, "page": []string{strconv.Itoa(page)}}, &vars)
+		if err != nil {
+			if httpUnavailable(err) {
+				return providerRow("gitlab", "repo", p.PathWithNamespace, "repo-secrets", "CI variables are protected and masked", "medium", StatusSkipped, "CI variables API unavailable", rem)
+			}
+			return providerRow("gitlab", "repo", p.PathWithNamespace, "repo-secrets", "CI variables are protected and masked", "medium", StatusError, err.Error(), rem)
+		}
+		total += len(vars)
+		for _, v := range vars {
+			if !v.Protected || !v.Masked {
+				weak = append(weak, v.Key)
+			}
+		}
+		next, e := strconv.Atoi(resp.Header.Get("X-Next-Page"))
+		if e != nil || next <= page {
+			break
+		}
+		page = next
 	}
 	if len(weak) > 0 {
-		return providerRow("gitlab", "repo", p.PathWithNamespace, "repo-secrets", "CI variables are protected and masked", "medium", StatusGap, "unprotected/unmasked variables: "+strings.Join(limitStrings(weak, maxDetailItems), ", "), "Protect and mask CI/CD variables where possible.")
+		return providerRow("gitlab", "repo", p.PathWithNamespace, "repo-secrets", "CI variables are protected and masked", "medium", StatusGap, "unprotected/unmasked variables: "+strings.Join(limitStrings(weak, maxDetailItems), ", "), rem)
 	}
-	return providerRow("gitlab", "repo", p.PathWithNamespace, "repo-secrets", "CI variables are protected and masked", "medium", StatusCompliant, fmt.Sprintf("%d variables reviewed", len(vars)), "Protect and mask CI/CD variables where possible.")
+	return providerRow("gitlab", "repo", p.PathWithNamespace, "repo-secrets", "CI variables are protected and masked", "medium", StatusCompliant, fmt.Sprintf("%d variables reviewed", total), rem)
+}
+
+// gitlabPaged grabs all pages of a GitLab list endpoint (X-Next-Page header).
+// otherwise we'd only see the first 100 items and report a false "compliant".
+func gitlabPaged[T any](ctx context.Context, c *restClient, path string, extra url.Values) ([]T, error) {
+	var all []T
+	page := 1
+	for {
+		q := url.Values{"per_page": []string{"100"}, "page": []string{strconv.Itoa(page)}}
+		for k, v := range extra {
+			q[k] = v
+		}
+		var batch []T
+		resp, err := c.get(ctx, path, q, &batch)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, batch...)
+		next, e := strconv.Atoi(resp.Header.Get("X-Next-Page"))
+		if e != nil || next <= page {
+			break
+		}
+		page = next
+	}
+	return all, nil
+}
+
+type gitlabDeployKey struct {
+	Title   string `json:"title"`
+	CanPush bool   `json:"can_push"`
+}
+
+type gitlabHook struct {
+	ID                    int    `json:"id"`
+	URL                   string `json:"url"`
+	EnableSSLVerification bool   `json:"enable_ssl_verification"`
+}
+
+type gitlabMember struct {
+	Username    string `json:"username"`
+	AccessLevel int    `json:"access_level"`
 }
 
 func auditGitLabDeployKeys(ctx context.Context, c *restClient, p gitlabProject) auditRow {
-	var keys []struct {
-		Title   string `json:"title"`
-		CanPush bool   `json:"can_push"`
-	}
-	_, err := c.get(ctx, gitlabProjectPath(p, "/deploy_keys"), url.Values{"per_page": []string{"100"}}, &keys)
+	keys, err := gitlabPaged[gitlabDeployKey](ctx, c, gitlabProjectPath(p, "/deploy_keys"), nil)
 	if err != nil {
 		if httpUnavailable(err) {
 			return providerRow("gitlab", "repo", p.PathWithNamespace, "deploy-keys", "Deploy keys are read-only or absent", "high", StatusSkipped, "deploy keys API unavailable", "Remove unused deploy keys and disable write access.")
@@ -381,12 +440,7 @@ func auditGitLabDeployKeys(ctx context.Context, c *restClient, p gitlabProject) 
 }
 
 func auditGitLabWebhooks(ctx context.Context, c *restClient, p gitlabProject) auditRow {
-	var hooks []struct {
-		ID                    int    `json:"id"`
-		URL                   string `json:"url"`
-		EnableSSLVerification bool   `json:"enable_ssl_verification"`
-	}
-	_, err := c.get(ctx, gitlabProjectPath(p, "/hooks"), url.Values{"per_page": []string{"100"}}, &hooks)
+	hooks, err := gitlabPaged[gitlabHook](ctx, c, gitlabProjectPath(p, "/hooks"), nil)
 	if err != nil {
 		if httpUnavailable(err) {
 			return providerRow("gitlab", "repo", p.PathWithNamespace, "webhooks", "Webhooks use TLS and SSL verification", "medium", StatusSkipped, "webhooks API unavailable", "Require HTTPS and SSL verification for webhooks.")
@@ -405,12 +459,11 @@ func auditGitLabWebhooks(ctx context.Context, c *restClient, p gitlabProject) au
 	return providerRow("gitlab", "repo", p.PathWithNamespace, "webhooks", "Webhooks use TLS and SSL verification", "medium", StatusCompliant, fmt.Sprintf("%d webhooks reviewed", len(hooks)), "Require HTTPS and SSL verification for webhooks.")
 }
 
+// gitlabMaintainer is GitLab's access_level for Maintainer; >= this is privileged.
+const gitlabMaintainer = 40
+
 func auditGitLabCollaborators(ctx context.Context, c *restClient, p gitlabProject) auditRow {
-	var members []struct {
-		Username    string `json:"username"`
-		AccessLevel int    `json:"access_level"`
-	}
-	_, err := c.get(ctx, gitlabProjectPath(p, "/members"), url.Values{"per_page": []string{"100"}}, &members)
+	members, err := gitlabPaged[gitlabMember](ctx, c, gitlabProjectPath(p, "/members"), nil)
 	if err != nil {
 		if httpUnavailable(err) {
 			return providerRow("gitlab", "repo", p.PathWithNamespace, "collaborators", "Direct maintainers/owners are reviewed", "medium", StatusSkipped, "members API unavailable", "Prefer group-managed access and remove stale direct maintainers.")
@@ -419,7 +472,7 @@ func auditGitLabCollaborators(ctx context.Context, c *restClient, p gitlabProjec
 	}
 	var privileged []string
 	for _, member := range members {
-		if member.AccessLevel >= 40 {
+		if member.AccessLevel >= gitlabMaintainer {
 			privileged = append(privileged, member.Username)
 		}
 	}
@@ -430,8 +483,7 @@ func auditGitLabCollaborators(ctx context.Context, c *restClient, p gitlabProjec
 }
 
 func auditGitLabVulnerabilities(ctx context.Context, c *restClient, p gitlabProject) auditRow {
-	var vulns []map[string]any
-	_, err := c.get(ctx, gitlabProjectPath(p, "/vulnerability_findings"), url.Values{"state": []string{"detected"}, "per_page": []string{"100"}}, &vulns)
+	vulns, err := gitlabPaged[map[string]any](ctx, c, gitlabProjectPath(p, "/vulnerability_findings"), url.Values{"state": []string{"detected"}})
 	if err != nil {
 		if httpUnavailable(err) {
 			return providerRow("gitlab", "repo", p.PathWithNamespace, "vulnerability-alert-count", "Open vulnerability findings are triaged", "high", StatusSkipped, "vulnerability findings API unavailable", "Enable GitLab security scanning and triage findings.")
@@ -460,8 +512,7 @@ func auditGitLabReleases(ctx context.Context, c *restClient, p gitlabProject) au
 }
 
 func auditGitLabPackages(ctx context.Context, c *restClient, p gitlabProject) auditRow {
-	var packages []map[string]any
-	_, err := c.get(ctx, gitlabProjectPath(p, "/packages"), url.Values{"per_page": []string{"100"}}, &packages)
+	packages, err := gitlabPaged[map[string]any](ctx, c, gitlabProjectPath(p, "/packages"), nil)
 	if err != nil {
 		if httpUnavailable(err) {
 			return providerRow("gitlab", "repo", p.PathWithNamespace, "packages", "Packages are inventoried", "low", StatusSkipped, "packages API unavailable", "Review package visibility and remove stale package versions.")
@@ -472,8 +523,7 @@ func auditGitLabPackages(ctx context.Context, c *restClient, p gitlabProject) au
 }
 
 func auditGitLabDependencies(ctx context.Context, c *restClient, p gitlabProject) auditRow {
-	var deps []map[string]any
-	_, err := c.get(ctx, gitlabProjectPath(p, "/dependencies"), url.Values{"per_page": []string{"100"}}, &deps)
+	deps, err := gitlabPaged[map[string]any](ctx, c, gitlabProjectPath(p, "/dependencies"), nil)
 	if err != nil {
 		if httpUnavailable(err) {
 			return providerRow("gitlab", "repo", p.PathWithNamespace, "dependency-sbom", "Dependency inventory/SBOM is available", "medium", StatusSkipped, "dependency inventory API unavailable", "Enable dependency scanning or SBOM export.")
@@ -506,32 +556,59 @@ func collectGiteaAudit(ctx context.Context, o *opts) ([]auditRow, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
+	want := wantFunc(o)
+	prov := o.provider
 	var rows []auditRow
-	rows = append(rows, providerRow(o.provider, "token", "authenticated-token", "token-scopes", "Token scopes are least privilege", "medium", StatusSkipped, "token scopes are not exposed by this API", "Use least-privilege tokens."))
+	if want("token-scopes") {
+		rows = append(rows, providerRow(prov, "token", "authenticated-token", "token-scopes", "Token scopes are least privilege", "medium", StatusSkipped, "token scopes are not exposed by this API", "Use least-privilege tokens."))
+	}
 	for _, repo := range repos {
-		rows = append(rows, auditGenericVisibility(o.provider, repo.FullName, !repo.Private))
-		rows = append(rows, auditGenericStale(o.provider, repo.FullName, repo.UpdatedAt, o.staleDays))
-		if repo.DefaultBranch == "" {
-			rows = append(rows, providerRow(o.provider, "repo", repo.FullName, "default-branch", "Default branch is set", "medium", StatusGap, "no default branch", "Set and protect the default branch."))
-		} else {
-			rows = append(rows, providerRow(o.provider, "repo", repo.FullName, "default-branch", "Default branch is set", "medium", StatusCompliant, "default branch: "+repo.DefaultBranch, "Set and protect the default branch."))
+		repo := repo
+		checks := []struct {
+			key string
+			run func() auditRow
+		}{
+			{"public-exposure", func() auditRow { return auditGenericVisibility(prov, repo.FullName, !repo.Private) }},
+			{"stale-repo", func() auditRow { return auditGenericStale(prov, repo.FullName, repo.UpdatedAt, o.staleDays) }},
+			{"default-branch", func() auditRow {
+				if repo.DefaultBranch == "" {
+					return providerRow(prov, "repo", repo.FullName, "default-branch", "Default branch is set", "medium", StatusGap, "no default branch", "Set and protect the default branch.")
+				}
+				return providerRow(prov, "repo", repo.FullName, "default-branch", "Default branch is set", "medium", StatusCompliant, "default branch: "+repo.DefaultBranch, "Set and protect the default branch.")
+			}},
+			{"branch-protection-full", func() auditRow { return auditGiteaBranchProtection(ctx, client, prov, repo) }},
+			{"required-workflows", func() auditRow { return auditGiteaWorkflows(ctx, client, prov, repo) }},
+			{"repo-secrets", func() auditRow { return auditGiteaSecrets(ctx, client, prov, repo) }},
+			{"deploy-keys", func() auditRow { return auditGiteaDeployKeys(ctx, client, prov, repo) }},
+			{"webhooks", func() auditRow { return auditGiteaWebhooks(ctx, client, prov, repo) }},
+			{"collaborators", func() auditRow { return auditGiteaCollaborators(ctx, client, prov, repo) }},
+			{"releases", func() auditRow { return auditGiteaReleases(ctx, client, prov, repo) }},
+			{"signed-commits", func() auditRow {
+				return providerRow(prov, "repo", repo.FullName, "signed-commits", "Signed commits required", "medium", StatusSkipped, "no portable signed-commit API found", "Use branch protection/rulesets if your instance supports signed commits.")
+			}},
+			{"environment-protection", func() auditRow {
+				return providerRow(prov, "repo", repo.FullName, "environment-protection", "Deployment environments are protected", "medium", StatusSkipped, "no portable environment protection API found", "Protect production-like environments when supported.")
+			}},
+			{"vulnerability-alert-count", func() auditRow {
+				return providerRow(prov, "repo", repo.FullName, "vulnerability-alert-count", "Vulnerability alerts are triaged", "high", StatusSkipped, "no portable vulnerability alert API found", "Enable dependency/security scanning on the instance or CI.")
+			}},
+			{"packages", func() auditRow {
+				return providerRow(prov, "repo", repo.FullName, "packages", "Packages are inventoried", "low", StatusSkipped, "packages are instance/user scoped in Gitea/Forgejo", "Review package visibility and stale versions.")
+			}},
+			{"dependency-sbom", func() auditRow {
+				return providerRow(prov, "repo", repo.FullName, "dependency-sbom", "Dependency SBOM is available", "medium", StatusSkipped, "no portable SBOM API found", "Generate SBOMs in CI.")
+			}},
+			{"archived-active-risk", func() auditRow {
+				if repo.Archived {
+					return providerRow(prov, "repo", repo.FullName, "archived-active-risk", "Archived repositories are reviewed", "low", StatusGap, "archived repository included in audit", "Disable actions/hooks/keys before archiving.")
+				}
+				return providerRow(prov, "repo", repo.FullName, "archived-active-risk", "Archived repositories are reviewed", "low", StatusCompliant, "repository is not archived", "Disable actions/hooks/keys before archiving.")
+			}},
 		}
-		rows = append(rows, auditGiteaBranchProtection(ctx, client, o.provider, repo))
-		rows = append(rows, auditGiteaWorkflows(ctx, client, o.provider, repo))
-		rows = append(rows, auditGiteaSecrets(ctx, client, o.provider, repo))
-		rows = append(rows, auditGiteaDeployKeys(ctx, client, o.provider, repo))
-		rows = append(rows, auditGiteaWebhooks(ctx, client, o.provider, repo))
-		rows = append(rows, auditGiteaCollaborators(ctx, client, o.provider, repo))
-		rows = append(rows, auditGiteaReleases(ctx, client, o.provider, repo))
-		rows = append(rows, providerRow(o.provider, "repo", repo.FullName, "signed-commits", "Signed commits required", "medium", StatusSkipped, "no portable signed-commit API found", "Use branch protection/rulesets if your instance supports signed commits."))
-		rows = append(rows, providerRow(o.provider, "repo", repo.FullName, "environment-protection", "Deployment environments are protected", "medium", StatusSkipped, "no portable environment protection API found", "Protect production-like environments when supported."))
-		rows = append(rows, providerRow(o.provider, "repo", repo.FullName, "vulnerability-alert-count", "Vulnerability alerts are triaged", "high", StatusSkipped, "no portable vulnerability alert API found", "Enable dependency/security scanning on the instance or CI."))
-		rows = append(rows, providerRow(o.provider, "repo", repo.FullName, "packages", "Packages are inventoried", "low", StatusSkipped, "packages are instance/user scoped in Gitea/Forgejo", "Review package visibility and stale versions."))
-		rows = append(rows, providerRow(o.provider, "repo", repo.FullName, "dependency-sbom", "Dependency SBOM is available", "medium", StatusSkipped, "no portable SBOM API found", "Generate SBOMs in CI."))
-		if repo.Archived {
-			rows = append(rows, providerRow(o.provider, "repo", repo.FullName, "archived-active-risk", "Archived repositories are reviewed", "low", StatusGap, "archived repository included in audit", "Disable actions/hooks/keys before archiving."))
-		} else {
-			rows = append(rows, providerRow(o.provider, "repo", repo.FullName, "archived-active-risk", "Archived repositories are reviewed", "low", StatusCompliant, "repository is not archived", "Disable actions/hooks/keys before archiving."))
+		for _, ch := range checks {
+			if want(ch.key) {
+				rows = append(rows, ch.run())
+			}
 		}
 	}
 	return rows, len(repos), nil
@@ -629,12 +706,46 @@ func auditGiteaSecrets(ctx context.Context, c *restClient, provider string, repo
 	return providerRow(provider, "repo", repo.FullName, "repo-secrets", "Action secrets are reviewed", "medium", StatusCompliant, fmt.Sprintf("%d action secrets visible", len(secrets)), "Review and rotate repository action secrets.")
 }
 
-func auditGiteaDeployKeys(ctx context.Context, c *restClient, provider string, repo giteaRepo) auditRow {
-	var keys []struct {
-		Title    string `json:"title"`
-		ReadOnly bool   `json:"read_only"`
+// giteaPaged grabs all pages of a Gitea/Forgejo list endpoint, stops on a short page.
+func giteaPaged[T any](ctx context.Context, c *restClient, path string) ([]T, error) {
+	var all []T
+	const limit = 50
+	for page := 1; ; page++ {
+		var batch []T
+		_, err := c.get(ctx, path, url.Values{"limit": []string{strconv.Itoa(limit)}, "page": []string{strconv.Itoa(page)}}, &batch)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, batch...)
+		if len(batch) < limit {
+			return all, nil
+		}
 	}
-	_, err := c.get(ctx, giteaRepoPath(repo, "/keys"), nil, &keys)
+}
+
+type giteaDeployKey struct {
+	Title    string `json:"title"`
+	ReadOnly bool   `json:"read_only"`
+}
+
+type giteaHook struct {
+	ID     int  `json:"id"`
+	Active bool `json:"active"`
+	Config struct {
+		URL                 string `json:"url"`
+		HTTPMethod          string `json:"http_method"`
+		SkipTLSVerify       bool   `json:"skip_tls_verify"`
+		AuthorizationHeader string `json:"authorization_header"`
+	} `json:"config"`
+}
+
+type giteaCollab struct {
+	Login      string `json:"login"`
+	Permission string `json:"permission"`
+}
+
+func auditGiteaDeployKeys(ctx context.Context, c *restClient, provider string, repo giteaRepo) auditRow {
+	keys, err := giteaPaged[giteaDeployKey](ctx, c, giteaRepoPath(repo, "/keys"))
 	if err != nil {
 		if httpUnavailable(err) {
 			return providerRow(provider, "repo", repo.FullName, "deploy-keys", "Deploy keys are read-only or absent", "high", StatusSkipped, "deploy keys API unavailable", "Remove unused deploy keys and disable write access.")
@@ -654,17 +765,7 @@ func auditGiteaDeployKeys(ctx context.Context, c *restClient, provider string, r
 }
 
 func auditGiteaWebhooks(ctx context.Context, c *restClient, provider string, repo giteaRepo) auditRow {
-	var hooks []struct {
-		ID     int  `json:"id"`
-		Active bool `json:"active"`
-		Config struct {
-			URL                 string `json:"url"`
-			HTTPMethod          string `json:"http_method"`
-			SkipTLSVerify       bool   `json:"skip_tls_verify"`
-			AuthorizationHeader string `json:"authorization_header"`
-		} `json:"config"`
-	}
-	_, err := c.get(ctx, giteaRepoPath(repo, "/hooks"), nil, &hooks)
+	hooks, err := giteaPaged[giteaHook](ctx, c, giteaRepoPath(repo, "/hooks"))
 	if err != nil {
 		if httpUnavailable(err) {
 			return providerRow(provider, "repo", repo.FullName, "webhooks", "Webhooks use TLS and active hooks are reviewed", "medium", StatusSkipped, "webhooks API unavailable", "Require HTTPS and TLS verification for webhooks.")
@@ -684,11 +785,7 @@ func auditGiteaWebhooks(ctx context.Context, c *restClient, provider string, rep
 }
 
 func auditGiteaCollaborators(ctx context.Context, c *restClient, provider string, repo giteaRepo) auditRow {
-	var collabs []struct {
-		Login      string `json:"login"`
-		Permission string `json:"permission"`
-	}
-	_, err := c.get(ctx, giteaRepoPath(repo, "/collaborators"), nil, &collabs)
+	collabs, err := giteaPaged[giteaCollab](ctx, c, giteaRepoPath(repo, "/collaborators"))
 	if err != nil {
 		if httpUnavailable(err) {
 			return providerRow(provider, "repo", repo.FullName, "collaborators", "Collaborators are reviewed", "medium", StatusSkipped, "collaborators API unavailable", "Review direct collaborators and remove stale admins.")

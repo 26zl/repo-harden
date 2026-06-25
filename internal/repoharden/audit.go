@@ -59,7 +59,7 @@ func collectAudit(ctx context.Context, c *github.Client, o *opts, repos []*githu
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
-	return rows, nil // cmdAudit sorts the merged rows
+	return rows, nil // cmdAudit sorts these
 }
 
 func auditLess(a, b auditRow) bool {
@@ -185,6 +185,14 @@ func auditControlKeys() map[string]bool {
 		"open-security-advisories",
 		"workflow-access-level",
 		"actions-sha-pinning",
+		"community-health",
+		"code-scanning-conflict",
+		"ruleset-evaluate-only",
+		"workflow-token-permissions",
+		"no-merge-method",
+		"fork-policy",
+		"wiki-attack-surface",
+		"org-outside-collaborators",
 		"account-2fa",
 		"dependabot-config",
 		"org-2fa-disabled-members",
@@ -258,6 +266,19 @@ func runAudit(ctx context.Context, c *github.Client, o *opts) ([]auditRow, int, 
 	}
 }
 
+// wantFunc says whether a control should run, based on --only/--skip.
+// we use this to skip the API call, not just filter the output.
+func wantFunc(o *opts) func(string) bool {
+	onlySet := splitSet(o.only)
+	skipSet := splitSet(o.skip)
+	return func(key string) bool {
+		if len(onlySet) > 0 && !onlySet[key] {
+			return false
+		}
+		return !skipSet[key]
+	}
+}
+
 func filterAuditRows(rows []auditRow, o *opts) []auditRow {
 	onlySet := splitSet(o.only)
 	skipSet := splitSet(o.skip)
@@ -291,7 +312,7 @@ func renderAudit(rows []auditRow, repoCount int, o *opts) error {
 	case "json":
 		return json.NewEncoder(os.Stdout).Encode(rows)
 	case "markdown":
-		renderAuditMarkdown(rows, repoCount, o)
+		renderAuditMarkdown(rows, repoCount)
 	case "sarif":
 		return json.NewEncoder(os.Stdout).Encode(auditSARIF(rows))
 	default:
@@ -318,22 +339,49 @@ func renderAuditTable(rows []auditRow, repoCount int, o *opts) {
 		}
 		return order[i] < order[j]
 	})
+	hidden := 0
 	for _, target := range order {
 		grp := groups[target]
+		display := grp
+		if !o.all {
+			// default: just findings, skip clean repos
+			display = actionableRows(grp)
+			if len(display) == 0 {
+				hidden++
+				continue
+			}
+		}
 		fmt.Printf("\n%s  %s\n",
 			colorize(o, colorCyan, target),
-			colorize(o, colorGray, fmt.Sprintf("(%d/100)", auditScore(grp))))
-		printAuditRows(grp, o)
+			colorize(o, colorGray, fmt.Sprintf("(%d/100)", auditScore(grp)))) // score uses the whole group
+		printAuditRows(display, o)
+	}
+	if hidden > 0 {
+		fmt.Printf("\n%s\n", colorize(o, colorGray,
+			fmt.Sprintf("%d repo(s) with no gaps or errors hidden — use --all to show every check", hidden)))
 	}
 	renderTopRecommendations(rows, o)
 }
+
+// actionableRows just the gap/error rows.
+func actionableRows(rows []auditRow) []auditRow {
+	var out []auditRow
+	for _, r := range rows {
+		if r.Status == string(StatusGap) || r.Status == string(StatusError) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+const detailColWidth = 70
 
 func printAuditRows(rows []auditRow, o *opts) {
 	type cell struct{ plain, shown string }
 	var grid [][]cell
 	for _, r := range rows {
 		sym, _ := statusGlyph(r.Status)
-		detail := truncate(r.Detail, 70)
+		detail := truncate(r.Detail, detailColWidth)
 		grid = append(grid, []cell{
 			{"  " + sym, "  " + glyph(o, r.Status)},
 			{r.Severity, severityLabel(o, r.Severity)},
@@ -345,7 +393,7 @@ func printAuditRows(rows []auditRow, o *opts) {
 	widths := make([]int, 5)
 	for _, row := range grid {
 		for i, c := range row {
-			if w := runeWidth(c.plain); w > widths[i] {
+			if w := runeCount(c.plain); w > widths[i] {
 				widths[i] = w
 			}
 		}
@@ -355,14 +403,14 @@ func printAuditRows(rows []auditRow, o *opts) {
 		for i, c := range row {
 			b.WriteString(c.shown)
 			if i < len(row)-1 {
-				b.WriteString(strings.Repeat(" ", widths[i]-runeWidth(c.plain)+2))
+				b.WriteString(strings.Repeat(" ", widths[i]-runeCount(c.plain)+2))
 			}
 		}
 		fmt.Println(strings.TrimRight(b.String(), " "))
 	}
 }
 
-// score color thresholds: below scoreLow = red, below scoreOK = yellow, else green.
+// score colors: below scoreLow red, below scoreOK yellow, else green.
 const (
 	scoreLow = 50
 	scoreOK  = 80
@@ -417,7 +465,7 @@ func renderTopRecommendations(rows []auditRow, o *opts) {
 	}
 }
 
-func renderAuditMarkdown(rows []auditRow, repoCount int, o *opts) {
+func renderAuditMarkdown(rows []auditRow, repoCount int) {
 	fmt.Printf("# repo-harden audit\n\n")
 	fmt.Printf("Score: **%d/100**  \n", auditScore(rows))
 	fmt.Printf("Repositories scanned: **%d**\n\n", repoCount)
@@ -428,7 +476,6 @@ func renderAuditMarkdown(rows []auditRow, repoCount int, o *opts) {
 			markdownEscape(r.Severity), markdownEscape(r.Status), markdownEscape(r.Scope),
 			markdownEscape(r.Repo), markdownEscape(r.Control), markdownEscape(r.Detail))
 	}
-	_ = o
 }
 
 func markdownEscape(s string) string {
@@ -482,8 +529,10 @@ func auditSARIF(rows []auditRow) map[string]any {
 		"runs": []map[string]any{{
 			"tool": map[string]any{
 				"driver": map[string]any{
-					"name":  "repo-harden",
-					"rules": ruleList,
+					"name":           "repo-harden",
+					"version":        Version,
+					"informationUri": "https://github.com/26zl/repo-harden",
+					"rules":          ruleList,
 				},
 			},
 			"results": results,

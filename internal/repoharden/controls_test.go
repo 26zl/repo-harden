@@ -3,6 +3,7 @@ package repoharden
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -31,6 +32,19 @@ func controlByKey(t *testing.T, key string) Control {
 	}
 	t.Fatalf("control %q not registered", key)
 	return Control{}
+}
+
+func TestDetectSkipsOnNoAdminAccess(t *testing.T) {
+	// 403 = collaborator without admin -> skipped, not a noisy error
+	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusForbidden, Header: make(http.Header), Body: http.NoBody, Request: req}, nil
+	})})
+	for _, key := range []string{"token-readonly", "actions-allowlist", "dependabot-fixes", "dependabot-alerts"} {
+		ctl := controlByKey(t, key)
+		if res := ctl.Detect(context.Background(), client, "me", "app", &github.Repository{}); res.Status != StatusSkipped {
+			t.Errorf("%s on 403: got %s (%s), want skipped", key, res.Status, res.Detail)
+		}
+	}
 }
 
 func TestSecurityMdDetectErrorsOnNon404(t *testing.T) {
@@ -137,6 +151,18 @@ func TestActionsAllowlistDisabledAndPatterns(t *testing.T) {
 	})
 	if got := ctl.Detect(context.Background(), patterns, "me", "app", nil); got.Status != StatusGap {
 		t.Fatalf("extra patterns: got %s, want gap", got.Status)
+	}
+}
+
+func TestPrivateVulnerabilityReportingDetect(t *testing.T) {
+	ctl := controlByKey(t, "private-vulnerability-reporting")
+	off := mockClient(map[string]string{"GET /repos/me/app/private-vulnerability-reporting": `{"enabled":false}`})
+	if got := ctl.Detect(context.Background(), off, "me", "app", &github.Repository{}); got.Status != StatusGap {
+		t.Fatalf("disabled: got %s, want gap", got.Status)
+	}
+	on := mockClient(map[string]string{"GET /repos/me/app/private-vulnerability-reporting": `{"enabled":true}`})
+	if got := ctl.Detect(context.Background(), on, "me", "app", &github.Repository{}); got.Status != StatusCompliant {
+		t.Fatalf("enabled: got %s, want compliant", got.Status)
 	}
 }
 
@@ -303,6 +329,85 @@ func TestSecretScanningDetectPublic(t *testing.T) {
 	})
 	if got := ctl.Detect(context.Background(), on, "me", "app", &github.Repository{Private: github.Ptr(false)}); got.Status != StatusCompliant {
 		t.Fatalf("public+on: got %s, want compliant", got.Status)
+	}
+}
+
+func TestSecretScanningApplyEnables(t *testing.T) {
+	var method, body string
+	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/repos/me/app" {
+			method = req.Method
+			if req.Body != nil {
+				b, _ := io.ReadAll(req.Body)
+				body = string(b)
+			}
+			return jsonResponse(`{}`), nil
+		}
+		return &http.Response{StatusCode: 404, Header: make(http.Header), Body: http.NoBody}, nil
+	})})
+	ctl := controlByKey(t, "secret-scanning")
+	if err := ctl.Apply(context.Background(), client, "me", "app"); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if method != http.MethodPatch {
+		t.Fatalf("apply method = %s, want PATCH", method)
+	}
+	if !strings.Contains(body, `"secret_scanning"`) || !strings.Contains(body, `"status":"enabled"`) {
+		t.Fatalf("apply did not enable secret scanning: %s", body)
+	}
+}
+
+func TestSecretScanningRevertNoopWhenWasEnabled(t *testing.T) {
+	patches := 0
+	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodPatch {
+			patches++
+		}
+		return jsonResponse(`{}`), nil
+	})})
+	ctl := controlByKey(t, "secret-scanning")
+	prior := `{"secret_scanning":"enabled","push_protection":"enabled"}`
+	if err := ctl.Revert(context.Background(), client, "me", "app", prior); err != nil {
+		t.Fatalf("revert: %v", err)
+	}
+	if patches != 0 {
+		t.Fatalf("revert of already-enabled should make no PATCH, made %d", patches)
+	}
+}
+
+func TestSecretScanningRevertRestoresDisabled(t *testing.T) {
+	var body string
+	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodPatch && req.URL.Path == "/repos/me/app" {
+			b, _ := io.ReadAll(req.Body)
+			body = string(b)
+		}
+		return jsonResponse(`{}`), nil
+	})})
+	ctl := controlByKey(t, "secret-scanning")
+	prior := `{"secret_scanning":"disabled","push_protection":"disabled"}`
+	if err := ctl.Revert(context.Background(), client, "me", "app", prior); err != nil {
+		t.Fatalf("revert: %v", err)
+	}
+	if !strings.Contains(body, `"status":"disabled"`) {
+		t.Fatalf("revert should restore disabled, body: %s", body)
+	}
+}
+
+func TestParseSecretScanningPriorRoundTrip(t *testing.T) {
+	// what Detect encodes must decode back to the same values
+	in := secretScanningPrior{SecretScanning: "enabled", PushProtection: "disabled"}
+	got := parseSecretScanningPrior(encodePrior(in))
+	if got != in {
+		t.Fatalf("round-trip = %+v, want %+v", got, in)
+	}
+	// legacy "enabled" string -> both enabled
+	if p := parseSecretScanningPrior("enabled"); p.SecretScanning != "enabled" || p.PushProtection != "enabled" {
+		t.Fatalf("legacy enabled = %+v", p)
+	}
+	// empty/unknown -> disabled (safe default)
+	if p := parseSecretScanningPrior(""); p.SecretScanning != "disabled" || p.PushProtection != "disabled" {
+		t.Fatalf("empty prior = %+v, want disabled", p)
 	}
 }
 

@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 )
 
-// StateEntry records one Actions workflow that disable-all turned off.
+// StateEntry is one workflow disable-all turned off.
 type StateEntry struct {
 	Repo string `json:"repo"`
 	ID   int64  `json:"id"`
@@ -17,7 +17,7 @@ type StateEntry struct {
 	Path string `json:"path"`
 }
 
-// HardenEntry records one change harden made, so revert can undo exactly it.
+// HardenEntry is one change harden made, so revert can undo it.
 type HardenEntry struct {
 	Repo    string `json:"repo"`
 	Control string `json:"control"`
@@ -78,7 +78,7 @@ func saveState(path string, e []StateEntry) error        { return saveJSON(path,
 func loadHardenState(path string) ([]HardenEntry, error) { return loadJSON[HardenEntry](path) }
 func saveHardenState(path string, e []HardenEntry) error { return saveJSON(path, e) }
 
-// stateDir returns the directory used for both state files.
+// stateDir is the dir for both state files.
 func stateDir() (string, error) {
 	dir := os.Getenv("REPO_HARDEN_STATE_DIR")
 	if dir == "" {

@@ -14,7 +14,7 @@ const (
 	colorYellow = "\x1b[33m"
 	colorCyan   = "\x1b[36m"
 	colorGray   = "\x1b[90m"
-	colorGo     = "\x1b[38;5;38m" // Go Gopher Blue (#00ADD8); 256-color for Terminal.app compat
+	colorGo     = "\x1b[38;5;38m" // Go gopher blue, 256-color so Terminal.app works
 )
 
 const banner = `                       _                _
@@ -23,10 +23,24 @@ const banner = `                       _                _
 |_| \___| .__/\___/   |_||_\__,_|_| \__,_\___|_||_|
         |_|`
 
-// printUsageBanner prints the ASCII wordmark + tagline (color auto-gated).
+// printUsageBanner prints the ASCII wordmark and tagline.
 func printUsageBanner() {
 	fmt.Println(colorize(nil, colorGo, banner))
 	fmt.Println(colorize(nil, colorGray, "  one command · every repo · reversible"))
+	fmt.Println()
+}
+
+// maybePrintBanner shows the wordmark before a command, but only on a real
+// terminal. skip it for json/sarif/markdown so pipes stay clean.
+func maybePrintBanner(o *opts) {
+	if o != nil && (o.jsonOut || o.format == "json" || o.format == "sarif" || o.format == "markdown") {
+		return
+	}
+	info, err := os.Stdout.Stat()
+	if err != nil || info.Mode()&os.ModeCharDevice == 0 {
+		return
+	}
+	fmt.Println(colorize(o, colorGo, banner))
 	fmt.Println()
 }
 
@@ -168,4 +182,5 @@ func truncate(s string, n int) string {
 	return string([]rune(s)[:n-1]) + "…"
 }
 
-func runeWidth(s string) int { return utf8.RuneCountInString(s) }
+// runeCount counts runes, not display width (fine for our ASCII columns).
+func runeCount(s string) int { return utf8.RuneCountInString(s) }

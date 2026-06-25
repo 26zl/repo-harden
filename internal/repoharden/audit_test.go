@@ -2,11 +2,93 @@ package repoharden
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/google/go-github/v88/github"
 )
+
+func TestAuditSARIF(t *testing.T) {
+	rows := []auditRow{
+		{Control: "secret-scanning", Title: "Secret scanning", Severity: "critical", Status: string(StatusGap), Remediation: "Enable", Repo: "me/app", Detail: "off"},
+		{Control: "ok", Status: string(StatusCompliant), Repo: "me/app"}, // excluded
+	}
+	b, err := json.Marshal(auditSARIF(rows))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s struct {
+		Runs []struct {
+			Tool struct {
+				Driver struct {
+					Rules []struct {
+						ID string `json:"id"`
+					} `json:"rules"`
+				} `json:"driver"`
+			} `json:"tool"`
+			Results []struct {
+				RuleID string `json:"ruleId"`
+			} `json:"results"`
+		} `json:"runs"`
+	}
+	if err := json.Unmarshal(b, &s); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Runs) != 1 || len(s.Runs[0].Results) != 1 || s.Runs[0].Results[0].RuleID != "secret-scanning" {
+		t.Fatalf("SARIF should carry only the gap result, got %+v", s.Runs)
+	}
+	if len(s.Runs[0].Tool.Driver.Rules) != 1 {
+		t.Fatalf("want 1 rule, got %d", len(s.Runs[0].Tool.Driver.Rules))
+	}
+}
+
+func TestRenderAuditJSONRoundTrips(t *testing.T) {
+	rows := []auditRow{{Control: "x", Status: string(StatusGap), Repo: "me/app"}}
+	out := captureStdout(t, func() { _ = renderAudit(rows, 1, &opts{format: "json"}) })
+	var got []auditRow
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("json output invalid: %v\n%s", err, out)
+	}
+	if len(got) != 1 || got[0].Control != "x" {
+		t.Fatalf("roundtrip mismatch: %+v", got)
+	}
+}
+
+func TestRenderAuditMarkdownSmoke(t *testing.T) {
+	rows := []auditRow{{Control: "secret-scanning", Title: "Secret scanning", Severity: "critical", Status: string(StatusGap), Repo: "me/app", Detail: "off"}}
+	out := captureStdout(t, func() { renderAuditMarkdown(rows, 1) })
+	if !strings.Contains(out, "secret-scanning") {
+		t.Fatalf("markdown output missing control:\n%s", out)
+	}
+}
+
+func TestRenderAuditTableSmoke(t *testing.T) {
+	// default --format table is what most users see; make sure it renders a mixed
+	// set (incl. empty) without panicking and shows the control.
+	rows := []auditRow{
+		{Control: "secret-scanning", Title: "Secret scanning", Severity: "critical", Status: string(StatusGap), Repo: "me/app", Detail: "off"},
+		{Control: "stale-repo", Severity: "low", Status: string(StatusCompliant), Repo: "me/app"},
+	}
+	out := captureStdout(t, func() { renderAuditTable(rows, 1, &opts{format: "table", color: "never"}) })
+	if !strings.Contains(out, "secret-scanning") {
+		t.Fatalf("table output missing control:\n%s", out)
+	}
+	// empty set must not panic
+	_ = captureStdout(t, func() { renderAuditTable(nil, 0, &opts{format: "table", color: "never"}) })
+}
+
+func TestAuditLessSortsCriticalGapFirst(t *testing.T) {
+	critGap := auditRow{Severity: "critical", Status: string(StatusGap)}
+	lowOK := auditRow{Severity: "low", Status: string(StatusCompliant)}
+	if !auditLess(critGap, lowOK) {
+		t.Fatal("critical/gap should sort before low/compliant")
+	}
+	if auditLess(lowOK, critGap) {
+		t.Fatal("sort order is not symmetric")
+	}
+}
 
 func TestCollectAuditReportsGapAndCompliant(t *testing.T) {
 	saved := baseline
@@ -63,6 +145,18 @@ func TestFilterAuditRowsOnlyAndSkip(t *testing.T) {
 	skip := filterAuditRows(append([]auditRow{}, rows...), &opts{skip: "b"})
 	if len(skip) != 2 || skip[0].Control != "a" || skip[1].Control != "c" {
 		t.Fatalf("skip filter = %+v, want a/c", skip)
+	}
+}
+
+func TestActionableRows(t *testing.T) {
+	rows := []auditRow{
+		{Control: "a", Status: string(StatusGap)},
+		{Control: "b", Status: string(StatusError)},
+		{Control: "c", Status: string(StatusCompliant)},
+		{Control: "d", Status: string(StatusSkipped)},
+	}
+	if got := actionableRows(rows); len(got) != 2 {
+		t.Fatalf("got %d rows, want 2 (gap+error only)", len(got))
 	}
 }
 

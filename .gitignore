@@ -6,7 +6,7 @@
 *.out
 coverage.*
 
-# Local state (in case GHA_STATE_DIR points here)
+# Local state (in case REPO_HARDEN_STATE_DIR points here)
 /.repo-harden/
 enabled-workflows.json
 

@@ -1,6 +1,7 @@
 package repoharden
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,33 +10,115 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/cli/go-gh/v2/pkg/auth"
 	"github.com/google/go-github/v88/github"
 	"golang.org/x/sync/errgroup"
 )
 
+// adds the bearer token. retryTransport retries GET/HEAD on 429/5xx with backoff.
+type authTransport struct {
+	token string
+	base  http.RoundTripper
+}
+
+func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	req.Header.Set("Authorization", "Bearer "+t.token)
+	return t.base.RoundTrip(req)
+}
+
+type retryTransport struct {
+	base http.RoundTripper
+	max  int
+}
+
+func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method != http.MethodGet && req.Method != http.MethodHead {
+		return rt.base.RoundTrip(req) // don't retry mutations
+	}
+	for attempt := 0; ; attempt++ {
+		resp, err := rt.base.RoundTrip(req)
+		if err == nil && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
+			return resp, nil
+		}
+		if attempt >= rt.max {
+			return resp, err
+		}
+		wait := time.Duration(1<<attempt) * time.Second
+		if resp != nil {
+			if ra, e := strconv.Atoi(resp.Header.Get("Retry-After")); e == nil && ra > 0 {
+				wait = time.Duration(ra) * time.Second
+			}
+			resp.Body.Close()
+		}
+		select {
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
+func newGitHubHTTPClient(token string) *http.Client {
+	return &http.Client{
+		Timeout:       90 * time.Second,
+		CheckRedirect: noCrossHostRedirect,
+		Transport: &retryTransport{
+			base: &authTransport{token: token, base: http.DefaultTransport},
+			max:  3,
+		},
+	}
+}
+
+// noCrossHostRedirect blocks redirects to another host. we set the token in a
+// RoundTripper, so Go re-adds it on every hop including cross-host ones — that
+// would leak it. caps at 10 like the stdlib default.
+func noCrossHostRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) > 0 && req.URL.Host != via[0].URL.Host {
+		return fmt.Errorf("refusing cross-host redirect to %s", req.URL.Host)
+	}
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	return nil
+}
+
 const defaultConcurrency = 8
 
 const dynamicPrefix = "dynamic/"
 
+// build info, overridden via -ldflags -X main.* by GoReleaser.
+var (
+	Version = "dev"
+	Commit  = "none"
+	Date    = "unknown"
+)
+
 type opts struct {
 	dryRun          bool
 	owner           string
+	repo            string
 	includeForks    bool
 	includeDynamic  bool
 	includeArchived bool
 	adminOnly       bool
 	concurrency     int
 	jsonOut         bool
+	all             bool
 	color           string
 	noColor         bool
 	provider        string
 	host            string
 	token           string
+	tokenStdin      bool
 	format          string
 	exitCode        bool
 	orgAudit        bool
@@ -47,26 +130,35 @@ type opts struct {
 
 func Main() {
 	if len(os.Args) < 2 {
-		usage()
-		os.Exit(1)
+		fmt.Fprintln(os.Stderr, "repo-harden: no command given; run 'repo-harden help'")
+		os.Exit(2)
 	}
 	cmd := os.Args[1]
 
+	if cmd == "version" || cmd == "--version" || cmd == "-v" {
+		fmt.Printf("repo-harden %s (commit %s, built %s)\n", Version, Commit, Date)
+		return
+	}
+
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
+	fs.Usage = usage
 	o := &opts{concurrency: defaultConcurrency}
 	fs.BoolVar(&o.dryRun, "dry-run", false, "")
 	fs.StringVar(&o.owner, "owner", "", "")
+	fs.StringVar(&o.repo, "repo", "", "")
 	fs.BoolVar(&o.includeForks, "include-forks", false, "")
 	fs.BoolVar(&o.includeDynamic, "include-dynamic", false, "")
 	fs.BoolVar(&o.includeArchived, "include-archived", false, "")
 	fs.BoolVar(&o.adminOnly, "admin-only", false, "")
 	fs.IntVar(&o.concurrency, "concurrency", defaultConcurrency, "")
 	fs.BoolVar(&o.jsonOut, "json", false, "")
+	fs.BoolVar(&o.all, "all", false, "")
 	fs.StringVar(&o.color, "color", "auto", "")
 	fs.BoolVar(&o.noColor, "no-color", false, "")
 	fs.StringVar(&o.provider, "provider", "github", "")
 	fs.StringVar(&o.host, "host", "", "")
 	fs.StringVar(&o.token, "token", "", "")
+	fs.BoolVar(&o.tokenStdin, "token-stdin", false, "")
 	fs.StringVar(&o.format, "format", "table", "")
 	fs.BoolVar(&o.exitCode, "exit-code", false, "")
 	fs.BoolVar(&o.orgAudit, "org-audit", true, "")
@@ -81,21 +173,22 @@ func Main() {
 		o.concurrency = 1
 	}
 	if err := validateColorMode(o.color); err != nil {
-		die(err)
+		dieUsage(err)
 	}
 	normalizeOptions(o)
 	if err := validateOptions(o); err != nil {
-		die(err)
+		dieUsage(err)
 	}
 	args := fs.Args()
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	if cmd == "help" || cmd == "-h" || cmd == "--help" {
 		usage()
 		return
 	}
 	if cmd != "audit" && o.provider != "github" {
-		die(fmt.Errorf("%s currently supports --provider github only; use audit for %s", cmd, o.provider))
+		dieUsage(fmt.Errorf("%s currently supports --provider github only; use audit for %s", cmd, o.provider))
 	}
 
 	var client *github.Client
@@ -106,6 +199,8 @@ func Main() {
 			die(err)
 		}
 	}
+
+	maybePrintBanner(o)
 
 	switch cmd {
 	case "list":
@@ -131,8 +226,8 @@ func Main() {
 	case "controls":
 		err = cmdControls(o)
 	default:
-		usage()
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "repo-harden: unknown command %q; run 'repo-harden help'\n", cmd)
+		os.Exit(2)
 	}
 	if err != nil {
 		var code exitError
@@ -159,11 +254,13 @@ Commands:
   harden                     Apply the safe/free hardening, save revert state
   revert                     Undo exactly what harden changed
   controls                   List baseline controls (fixable + reversible)
+  version                    Print version and build info
   help                       Show this help
 
 Options:
   --dry-run                  Print actions without calling the API
   --owner <login>            Only touch repos owned by this user/org
+  --repo <owner/repo>        Only these repos (comma-separated); skips the full scan
   --include-forks            Include forked repos (default: skipped)
   --include-archived         Include archived repos in audit/list operations
   --admin-only               Only repos you can administer (avoids 403 noise)
@@ -173,11 +270,14 @@ Options:
   --concurrency <n>          Parallel API calls (default: 8)
   --json                     Emit JSON (list, status, audit)
   --format <fmt>             audit output: table, json, markdown, sarif
+  --all                      audit table: show every check, not just gaps/errors
   --color <mode>             Color output: auto, always, never (default: auto)
   --no-color                 Disable color (same as --color never / NO_COLOR)
   --provider <name>          audit provider: github, gitlab, gitea, forgejo
   --host <host-or-url>       Provider host (GitHub Enterprise, GitLab, Gitea)
-  --token <token>            Provider token (prefer env vars in scripts)
+  --token <token>            Provider token (discouraged: visible in ps/shell history;
+                             prefer env vars, gh auth, or --token-stdin)
+  --token-stdin              Read the provider token from stdin
   --exit-code                audit exits 1 when gaps/errors are found
   --org-audit                Include GitHub organization-level checks (default)
   --stale-days <n>           Stale repository threshold (default: 180)
@@ -197,6 +297,13 @@ Env:
 func die(err error) {
 	fmt.Fprintln(os.Stderr, "error:", err)
 	os.Exit(1)
+}
+
+// dieUsage is for bad invocation (unknown flag/option), exit 2. die (exit 1) is
+// for operations that ran but failed.
+func dieUsage(err error) {
+	fmt.Fprintln(os.Stderr, "error:", err)
+	os.Exit(2)
 }
 
 func commandNeedsGitHubClient(cmd string, o *opts) bool {
@@ -240,6 +347,9 @@ func validateOptions(o *opts) error {
 	if o.staleDays < 1 {
 		return fmt.Errorf("--stale-days must be >= 1")
 	}
+	if o.repo != "" && o.provider != "github" {
+		return fmt.Errorf("--repo is only supported with --provider github")
+	}
 	return nil
 }
 
@@ -272,24 +382,42 @@ func tokenFromEnv(provider string) string {
 
 func newClient(o *opts) (*github.Client, error) {
 	host := hostName(o.host)
-	token := strings.TrimSpace(o.token)
-	if token == "" {
-		token, _ = auth.TokenForHost(host)
-	}
-	if token == "" {
-		token = tokenFromEnv("github")
+	token, err := resolveToken(o, host, "github")
+	if err != nil {
+		return nil, err
 	}
 	if token == "" {
 		return nil, fmt.Errorf("no GitHub token found for %s - run: gh auth login --hostname %s or set GITHUB_TOKEN", host, host)
 	}
+	hc := newGitHubHTTPClient(token)
 	if host == "github.com" {
-		return github.NewClient(github.WithAuthToken(token))
+		return github.NewClient(github.WithHTTPClient(hc))
 	}
 	apiURL, uploadURL := githubEnterpriseURLs(o.host)
 	if err := requireSecureURL(apiURL); err != nil {
 		return nil, err
 	}
-	return github.NewClient(github.WithAuthToken(token), github.WithEnterpriseURLs(apiURL, uploadURL))
+	return github.NewClient(github.WithHTTPClient(hc), github.WithEnterpriseURLs(apiURL, uploadURL))
+}
+
+// picks the token: --token-stdin, then --token, then gh auth, then env.
+func resolveToken(o *opts, host, provider string) (string, error) {
+	if o.tokenStdin {
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil && line == "" {
+			return "", fmt.Errorf("--token-stdin: failed to read token from stdin: %w", err)
+		}
+		return strings.TrimSpace(line), nil
+	}
+	if t := strings.TrimSpace(o.token); t != "" {
+		return t, nil
+	}
+	if provider == "github" {
+		if t, _ := auth.TokenForHost(host); t != "" {
+			return t, nil
+		}
+	}
+	return tokenFromEnv(provider), nil
 }
 
 func hostName(hostOrURL string) string {
@@ -319,8 +447,10 @@ func providerBaseURL(provider, hostOrURL string) string {
 }
 
 func githubEnterpriseURLs(hostOrURL string) (string, string) {
-	base := providerBaseURL("github", hostOrURL)
-	return strings.TrimRight(base, "/") + "/api/v3/", strings.TrimRight(base, "/") + "/api/uploads/"
+	base := strings.TrimRight(providerBaseURL("github", hostOrURL), "/")
+	// accept either the web root or the API url
+	base = strings.TrimSuffix(base, "/api/v3")
+	return base + "/api/v3/", base + "/api/uploads/"
 }
 
 func splitRepo(fullName string) (owner, name string) {
@@ -339,6 +469,10 @@ func skipWorkflow(wf *github.Workflow, o *opts) bool {
 }
 
 func listRepos(ctx context.Context, c *github.Client, o *opts) ([]*github.Repository, error) {
+	// --repo given, so just grab those repos directly
+	if o.repo != "" {
+		return getNamedRepos(ctx, c, o.repo)
+	}
 	var all []*github.Repository
 	opts := &github.RepositoryListByAuthenticatedUserOptions{
 		Affiliation: "owner,collaborator,organization_member",
@@ -377,6 +511,38 @@ func listRepos(ctx context.Context, c *github.Client, o *opts) ([]*github.Reposi
 	return out, nil
 }
 
+// fetches the repos named in a comma-separated owner/repo list. skips the
+// owner/fork/archived/admin filters since the user asked for these by name.
+func getNamedRepos(ctx context.Context, c *github.Client, csv string) ([]*github.Repository, error) {
+	var out []*github.Repository
+	seen := map[string]bool{}
+	for _, item := range strings.Split(csv, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		owner, name := splitRepo(item)
+		if owner == "" || name == "" {
+			return nil, fmt.Errorf("invalid --repo %q (expected owner/repo)", item)
+		}
+		key := owner + "/" + name
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		r, _, err := c.Repositories.Get(ctx, owner, name)
+		if err != nil {
+			return nil, fmt.Errorf("get repo %s: %w", key, err)
+		}
+		out = append(out, r)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("--repo had no valid owner/repo entries")
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].GetFullName() < out[j].GetFullName() })
+	return out, nil
+}
+
 func listWorkflows(ctx context.Context, c *github.Client, owner, name string) ([]*github.Workflow, error) {
 	var all []*github.Workflow
 	opts := &github.ListOptions{PerPage: 100}
@@ -404,10 +570,11 @@ type listRow struct {
 	Path  string `json:"path"`
 }
 
-func collectRows(ctx context.Context, c *github.Client, o *opts, repos []*github.Repository) ([]listRow, error) {
+func collectRows(ctx context.Context, c *github.Client, o *opts, repos []*github.Repository) ([]listRow, int, error) {
 	var (
-		mu   sync.Mutex
-		rows []listRow
+		mu         sync.Mutex
+		rows       []listRow
+		repoErrors int
 	)
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(o.concurrency)
@@ -418,6 +585,9 @@ func collectRows(ctx context.Context, c *github.Client, o *opts, repos []*github
 			wfs, err := listWorkflows(gctx, c, owner, name)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "warn: %s: %v\n", r.GetFullName(), err)
+				mu.Lock()
+				repoErrors++
+				mu.Unlock()
 				return nil
 			}
 			mu.Lock()
@@ -429,7 +599,7 @@ func collectRows(ctx context.Context, c *github.Client, o *opts, repos []*github
 		})
 	}
 	if err := g.Wait(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].Repo != rows[j].Repo {
@@ -437,7 +607,7 @@ func collectRows(ctx context.Context, c *github.Client, o *opts, repos []*github
 		}
 		return rows[i].Name < rows[j].Name
 	})
-	return rows, nil
+	return rows, repoErrors, nil
 }
 
 func cmdList(ctx context.Context, c *github.Client, o *opts) error {
@@ -445,16 +615,26 @@ func cmdList(ctx context.Context, c *github.Client, o *opts) error {
 	if err != nil {
 		return err
 	}
-	rows, err := collectRows(ctx, c, o, repos)
+	rows, repoErrors, err := collectRows(ctx, c, o, repos)
 	if err != nil {
 		return err
 	}
 	if o.jsonOut {
-		return json.NewEncoder(os.Stdout).Encode(rows)
+		if err := json.NewEncoder(os.Stdout).Encode(rows); err != nil {
+			return err
+		}
+		if repoErrors > 0 {
+			return exitError(1)
+		}
+		return nil
 	}
 	fmt.Println("STATE\tREPO\tWORKFLOW\tPATH")
 	for _, r := range rows {
 		fmt.Printf("%s\t%s\t%s\t%s\n", workflowStateLabel(o, r.State), r.Repo, r.Name, r.Path)
+	}
+	if repoErrors > 0 {
+		fmt.Fprintf(os.Stderr, "\n%d repo(s) could not be read\n", repoErrors)
+		return exitError(1)
 	}
 	return nil
 }
@@ -478,14 +658,19 @@ func cmdDisableAll(ctx context.Context, c *github.Client, o *opts) error {
 		have[entryKey(e.Repo, e.ID)] = true
 	}
 
+	// pass 1: find the active workflows to disable
+	type target struct {
+		owner, name string
+		id          int64
+		entry       StateEntry
+	}
 	var (
-		mu      sync.Mutex
-		added   []StateEntry
-		changed int
-		failed  int
-		skipped int
+		mu         sync.Mutex
+		targets    []target
+		added      []StateEntry
+		skipped    int
+		repoErrors int
 	)
-
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(o.concurrency)
 	for _, r := range repos {
@@ -495,6 +680,9 @@ func cmdDisableAll(ctx context.Context, c *github.Client, o *opts) error {
 			wfs, err := listWorkflows(gctx, c, owner, name)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "warn: %s: %v\n", r.GetFullName(), err)
+				mu.Lock()
+				repoErrors++
+				mu.Unlock()
 				return nil
 			}
 			for _, wf := range wfs {
@@ -507,19 +695,9 @@ func cmdDisableAll(ctx context.Context, c *github.Client, o *opts) error {
 					mu.Unlock()
 					continue
 				}
-				fmt.Printf("%-7s %s :: %s\n", actionLabel(o, "disable"), r.GetFullName(), wf.GetName())
-				if !o.dryRun {
-					if _, err := c.Actions.DisableWorkflowByID(gctx, owner, name, wf.GetID()); err != nil {
-						fmt.Fprintf(os.Stderr, "  FAILED: %v\n", err)
-						mu.Lock()
-						failed++
-						mu.Unlock()
-						continue
-					}
-				}
 				e := StateEntry{Repo: r.GetFullName(), ID: wf.GetID(), Name: wf.GetName(), Path: wf.GetPath()}
 				mu.Lock()
-				changed++
+				targets = append(targets, target{owner, name, wf.GetID(), e})
 				if !have[entryKey(e.Repo, e.ID)] {
 					added = append(added, e)
 					have[entryKey(e.Repo, e.ID)] = true
@@ -534,18 +712,53 @@ func cmdDisableAll(ctx context.Context, c *github.Client, o *opts) error {
 	}
 
 	if o.dryRun {
-		fmt.Printf("\ndry-run: would disable %d workflows (%d new state entries, %d dynamic skipped)\n",
-			changed, len(added), skipped)
+		fmt.Printf("\ndry-run: would disable %d workflows (%d new state entries, %d dynamic skipped, %d repos unreadable)\n",
+			len(targets), len(added), skipped, repoErrors)
+		if repoErrors > 0 {
+			return exitError(1)
+		}
 		return nil
 	}
 
+	// save state before disabling so a crash mid-run can still be undone with
+	// enable-all. over-recording is fine, enable is a no-op if already enabled.
 	merged := append(existing, added...)
 	if err := saveState(statePath, merged); err != nil {
 		return err
 	}
-	fmt.Printf("\ndisabled %d workflows (%d new state entries, %d failed, %d dynamic skipped); state has %d entries: %s\n",
-		changed, len(added), failed, skipped, len(merged), statePath)
-	if failed > 0 {
+
+	// Pass 2: disable.
+	var (
+		mu2     sync.Mutex
+		changed int
+		failed  int
+	)
+	g2, gctx2 := errgroup.WithContext(ctx)
+	g2.SetLimit(o.concurrency)
+	for _, t := range targets {
+		t := t
+		g2.Go(func() error {
+			mu2.Lock()
+			fmt.Printf("%-7s %s :: %s\n", actionLabel(o, "disable"), t.entry.Repo, t.entry.Name)
+			mu2.Unlock()
+			if _, err := c.Actions.DisableWorkflowByID(gctx2, t.owner, t.name, t.id); err != nil {
+				mu2.Lock()
+				failed++
+				fmt.Fprintf(os.Stderr, "  FAILED: %s :: %s: %v\n", t.entry.Repo, t.entry.Name, err)
+				mu2.Unlock()
+				return nil
+			}
+			mu2.Lock()
+			changed++
+			mu2.Unlock()
+			return nil
+		})
+	}
+	_ = g2.Wait()
+
+	fmt.Printf("\ndisabled %d workflows (%d new state entries, %d failed, %d dynamic skipped, %d repos unreadable); state has %d entries: %s\n",
+		changed, len(added), failed, skipped, repoErrors, len(merged), statePath)
+	if failed > 0 || repoErrors > 0 {
 		return exitError(1)
 	}
 	return nil
@@ -615,9 +828,10 @@ func cmdEnableAllDisabled(ctx context.Context, c *github.Client, o *opts) error 
 		return err
 	}
 	var (
-		mu      sync.Mutex
-		changed int
-		failed  int
+		mu         sync.Mutex
+		changed    int
+		failed     int
+		repoErrors int
 	)
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(o.concurrency)
@@ -628,6 +842,9 @@ func cmdEnableAllDisabled(ctx context.Context, c *github.Client, o *opts) error 
 			wfs, err := listWorkflows(gctx, c, owner, name)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "warn: %s: %v\n", r.GetFullName(), err)
+				mu.Lock()
+				repoErrors++
+				mu.Unlock()
 				return nil
 			}
 			for _, wf := range wfs {
@@ -660,11 +877,14 @@ func cmdEnableAllDisabled(ctx context.Context, c *github.Client, o *opts) error 
 	}
 	_ = g.Wait()
 	if o.dryRun {
-		fmt.Printf("\ndry-run: would enable %d workflows\n", changed)
+		fmt.Printf("\ndry-run: would enable %d workflows (%d repos unreadable)\n", changed, repoErrors)
+		if repoErrors > 0 {
+			return exitError(1)
+		}
 		return nil
 	}
-	fmt.Printf("\nenabled %d workflows (%d failed)\n", changed, failed)
-	if failed > 0 {
+	fmt.Printf("\nenabled %d workflows (%d failed, %d repos unreadable)\n", changed, failed, repoErrors)
+	if failed > 0 || repoErrors > 0 {
 		return exitError(1)
 	}
 	return nil
@@ -748,7 +968,7 @@ func cmdStatus(ctx context.Context, c *github.Client, o *opts) error {
 		return err
 	}
 	out.Repos = len(repos)
-	rows, err := collectRows(ctx, c, o, repos)
+	rows, repoErrors, err := collectRows(ctx, c, o, repos)
 	if err != nil {
 		return err
 	}
@@ -757,7 +977,13 @@ func cmdStatus(ctx context.Context, c *github.Client, o *opts) error {
 	}
 
 	if o.jsonOut {
-		return json.NewEncoder(os.Stdout).Encode(out)
+		if err := json.NewEncoder(os.Stdout).Encode(out); err != nil {
+			return err
+		}
+		if repoErrors > 0 {
+			return exitError(1)
+		}
+		return nil
 	}
 
 	fmt.Println("user:", out.User)
@@ -771,6 +997,10 @@ func cmdStatus(ctx context.Context, c *github.Client, o *opts) error {
 	sort.Strings(keys)
 	for _, k := range keys {
 		fmt.Printf("  %-20s %d\n", workflowStateLabel(o, k)+":", out.States[k])
+	}
+	if repoErrors > 0 {
+		fmt.Fprintf(os.Stderr, "\n%d repo(s) could not be read\n", repoErrors)
+		return exitError(1)
 	}
 	return nil
 }
