@@ -1,0 +1,22 @@
+# Binary
+/repo-harden
+
+# Go test artefacts
+*.test
+*.out
+coverage.*
+
+# Local state (in case GHA_STATE_DIR points here)
+/.repo-harden/
+enabled-workflows.json
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+!.vscode/settings.json
+
+# Claude Code
+.claude/
+CLAUDE.md
+.superpowers/
