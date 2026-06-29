@@ -9,12 +9,12 @@ coverage.*
 # Local state (in case REPO_HARDEN_STATE_DIR points here)
 /.repo-harden/
 enabled-workflows.json
+harden-state.json
 
 # Editor / OS
 .DS_Store
 .idea/
 .vscode/
-!.vscode/settings.json
 
 # Claude Code
 .claude/

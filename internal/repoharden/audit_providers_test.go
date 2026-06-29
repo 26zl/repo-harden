@@ -32,6 +32,19 @@ func TestGitlabPagedFollowsNextPage(t *testing.T) {
 	}
 }
 
+func TestGitlabPagedRejectsNonAdvancingPagination(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Next-Page", r.URL.Query().Get("page"))
+		_, _ = w.Write([]byte(`[{"id":1}]`))
+	}))
+	defer srv.Close()
+	client := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", prefix: "token ", client: srv.Client()}
+	if _, err := gitlabPaged[map[string]any](context.Background(), client, "/x", nil); err == nil ||
+		!strings.Contains(err.Error(), "X-Next-Page") {
+		t.Fatalf("non-advancing pagination should fail closed, got %v", err)
+	}
+}
+
 func TestGiteaPagedStopsOnShortPage(t *testing.T) {
 	full := "[" + strings.Repeat(`{"x":1},`, 49) + `{"x":1}]` // exactly 50 items
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -83,6 +96,11 @@ func TestRequireSecureURL(t *testing.T) {
 	if err := requireSecureURL("http://gitea.example.com"); err == nil {
 		t.Fatal("http to non-loopback host must be refused")
 	}
+	for _, raw := range []string{"file:///tmp/token", "ftp://gitea.example.com", "https://user@gitea.example.com"} {
+		if err := requireSecureURL(raw); err == nil {
+			t.Fatalf("unsafe URL %q must be refused", raw)
+		}
+	}
 }
 
 func TestEscapedFilePathKeepsPathSegments(t *testing.T) {
@@ -123,7 +141,11 @@ func TestAuditGitLabBranchProtectionClassifies(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if tc.status == http.StatusOK {
-					_, _ = w.Write([]byte(`{"name":"main"}`))
+					if strings.HasSuffix(r.URL.Path, "/approval_rules") {
+						_, _ = w.Write([]byte(`[{"approvals_required":1}]`))
+						return
+					}
+					_, _ = w.Write([]byte(`{"name":"main","allow_force_push":false,"push_access_levels":[{"access_level":0}]}`))
 					return
 				}
 				http.Error(w, "x", tc.status)
@@ -179,5 +201,64 @@ func TestGiteaWorkflowsPreservesNonUnavailableError(t *testing.T) {
 	row := auditGiteaWorkflows(context.Background(), client, "gitea", giteaRepo{FullName: "me/app", DefaultBranch: "main"})
 	if row.Status != string(StatusError) {
 		t.Fatalf("status = %s detail=%q, want error", row.Status, row.Detail)
+	}
+}
+
+func TestCollectGiteaAuditSmoke(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/user/repos" {
+			_, _ = w.Write([]byte(`[{
+				"full_name":"me/app",
+				"default_branch":"main",
+				"private":true,
+				"owner":{"login":"me"},
+				"permissions":{"admin":true}
+			}]`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	rows, count, err := collectGiteaAudit(context.Background(), &opts{
+		provider: "gitea", host: srv.URL, token: "t", staleDays: 180, concurrency: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || len(rows) == 0 {
+		t.Fatalf("count=%d rows=%d, want one repo with audit rows", count, len(rows))
+	}
+}
+
+func TestGiteaBranchProtectionRequiresDepth(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want ControlStatus
+	}{
+		{
+			name: "weak",
+			body: `[{"rule_name":"main","enable_push":true,"required_approvals":0}]`,
+			want: StatusGap,
+		},
+		{
+			name: "strong",
+			body: `[{"rule_name":"main","enable_push":false,"enable_force_push":false,"required_approvals":1}]`,
+			want: StatusCompliant,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			client := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", prefix: "token ", client: srv.Client()}
+			row := auditGiteaBranchProtection(context.Background(), client, "gitea", giteaRepo{
+				FullName: "me/app", DefaultBranch: "main",
+			})
+			if row.Status != string(tc.want) {
+				t.Fatalf("status=%s detail=%q, want %s", row.Status, row.Detail, tc.want)
+			}
+		})
 	}
 }

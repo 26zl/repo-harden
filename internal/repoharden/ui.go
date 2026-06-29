@@ -2,8 +2,10 @@ package repoharden
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -23,11 +25,64 @@ const banner = `                       _                _
 |_| \___| .__/\___/   |_||_\__,_|_| \__,_\___|_||_|
         |_|`
 
-// printUsageBanner prints the ASCII wordmark and tagline.
-func printUsageBanner() {
-	fmt.Println(colorize(nil, colorGo, banner))
-	fmt.Println(colorize(nil, colorGray, "  one command · every repo · reversible"))
-	fmt.Println()
+// printUsageBanner prints the ASCII wordmark and tagline to w.
+func printUsageBanner(w io.Writer) {
+	fmt.Fprintln(w, colorize(nil, colorGo, banner))
+	fmt.Fprintln(w, colorize(nil, colorGray, "  one command · every repo · reversible"))
+	fmt.Fprintln(w)
+}
+
+// sanitizeDetail strips ANSI escape sequences and control characters from
+// API-derived text (webhook URLs, repo/branch names, error strings) so it
+// cannot spoof the terminal or break table/markdown output. Bytes >= 0x80
+// (UTF-8 continuation/lead bytes) pass through untouched.
+func sanitizeDetail(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == 0x1b:
+			if i+1 >= len(s) {
+				continue
+			}
+			switch s[i+1] {
+			case '[': // CSI
+				i += 2
+				for i < len(s) && !(s[i] >= '@' && s[i] <= '~') {
+					i++
+				}
+			case ']', 'P', '^', '_': // OSC/DCS/PM/APC, terminated by BEL or ST
+				i += 2
+				for i < len(s) {
+					if s[i] == 0x07 {
+						break
+					}
+					if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '\\' {
+						i++
+						break
+					}
+					i++
+				}
+			default:
+				i++ // two-byte escape sequence
+			}
+		case c == '\n', c == '\r', c == '\t':
+			b.WriteByte(' ')
+		case c < 0x20 || c == 0x7f:
+			// drop other control characters
+		default:
+			b.WriteByte(c)
+		}
+	}
+	var clean strings.Builder
+	for _, r := range b.String() {
+		if unicode.IsControl(r) {
+			continue
+		}
+		clean.WriteRune(r)
+	}
+	return strings.TrimSpace(clean.String())
 }
 
 // maybePrintBanner shows the wordmark before a command, but only on a real

@@ -6,6 +6,8 @@ builds:
   - main: ./cmd/repo-harden
     binary: repo-harden
     env: [CGO_ENABLED=0]
+    # -trimpath strips local build paths for reproducible, path-free binaries
+    flags: [-trimpath]
     goos: [linux, darwin, windows]
     goarch: [amd64, arm64]
     # CommitTimestamp (not build time) so the same commit builds byte-identically

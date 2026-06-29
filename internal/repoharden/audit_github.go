@@ -7,17 +7,19 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/go-github/v88/github"
-	"gopkg.in/yaml.v3"
+	"golang.org/x/sync/errgroup"
 )
 
 func collectGitHubExtendedAudit(ctx context.Context, c *github.Client, o *opts, repos []*github.Repository) ([]auditRow, error) {
 	// gate each check by --only/--skip before the API call so we skip the work, not just the row
 	want := wantFunc(o)
 	var rows []auditRow
-	packageCache := map[string]githubPackageListResult{}
+	var mu sync.Mutex
+	pc := &githubPackageCache{m: map[string]*githubPackageCacheEntry{}}
 	if want("token-scopes") {
 		rows = append(rows, auditGitHubTokenScopes(ctx, c)...)
 	}
@@ -25,53 +27,72 @@ func collectGitHubExtendedAudit(ctx context.Context, c *github.Client, o *opts, 
 		rows = append(rows, auditGitHubAccountTwoFactor(ctx, c))
 	}
 	if o.orgAudit {
-		rows = append(rows, auditGitHubOrganizations(ctx, c, repos, want)...)
+		rows = append(rows, auditGitHubOrganizations(ctx, c, repos, want, o.showIdentifiers)...)
 	}
+	limit := o.concurrency
+	if limit < 1 { // a direct caller (or test) may leave concurrency 0; SetLimit(0) would deadlock
+		limit = 1
+	}
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(limit)
 	for _, repo := range repos {
-		owner, name := splitRepo(repo.GetFullName())
-		checks := []struct {
-			key string
-			run func() auditRow
-		}{
-			{"public-exposure", func() auditRow { return auditGitHubPublicExposure(repo) }},
-			{"stale-repo", func() auditRow { return auditGitHubStaleRepo(repo, o.staleDays) }},
-			{"default-branch", func() auditRow { return auditGitHubDefaultBranch(repo) }},
-			{"merge-hygiene", func() auditRow { return auditGitHubMergeHygiene(repo) }},
-			{"branch-protection-full", func() auditRow { return auditGitHubBranchProtection(ctx, c, owner, name, repo) }},
-			{"signed-commits", func() auditRow { return auditGitHubSignedCommits(ctx, c, owner, name, repo) }},
-			{"required-workflows", func() auditRow { return auditGitHubRequiredWorkflows(ctx, c, owner, name, repo) }},
-			{"actions-fork-pr-permissions", func() auditRow { return auditGitHubForkPRPolicy(ctx, c, owner, name, repo) }},
-			{"environment-protection", func() auditRow { return auditGitHubEnvironments(ctx, c, owner, name, repo) }},
-			{"repo-secrets", func() auditRow { return auditGitHubRepoSecrets(ctx, c, owner, name, repo, o.staleDays) }},
-			{"deploy-keys", func() auditRow { return auditGitHubDeployKeys(ctx, c, owner, name, repo) }},
-			{"webhooks", func() auditRow { return auditGitHubWebhooks(ctx, c, owner, name, repo) }},
-			{"collaborators", func() auditRow { return auditGitHubCollaborators(ctx, c, owner, name, repo) }},
-			{"vulnerability-alert-count", func() auditRow { return auditGitHubVulnerabilityCounts(ctx, c, owner, name, repo) }},
-			{"code-scanning-alert-count", func() auditRow { return auditGitHubCodeScanningCounts(ctx, c, owner, name, repo) }},
-			{"secret-scanning-alert-count", func() auditRow { return auditGitHubSecretScanningCounts(ctx, c, owner, name, repo) }},
-			{"archived-active-risk", func() auditRow { return auditGitHubArchivedActiveRisk(ctx, c, owner, name, repo) }},
-			{"releases", func() auditRow { return auditGitHubReleases(ctx, c, owner, name, repo) }},
-			{"packages", func() auditRow { return auditGitHubPackages(ctx, c, owner, repo, packageCache) }},
-			{"dependency-sbom", func() auditRow { return auditGitHubSBOM(ctx, c, owner, name, repo) }},
-			{"dependabot-open-alerts", func() auditRow { return auditGitHubDependabotOpenAlerts(ctx, c, owner, name, repo) }},
-			{"ruleset-bypass", func() auditRow { return auditGitHubRulesetBypass(ctx, c, owner, name, repo) }},
-			{"open-security-advisories", func() auditRow { return auditGitHubOpenSecurityAdvisories(ctx, c, owner, name, repo) }},
-			{"workflow-access-level", func() auditRow { return auditGitHubWorkflowAccessLevel(ctx, c, owner, name, repo) }},
-			{"actions-sha-pinning", func() auditRow { return auditGitHubActionsShaPinning(ctx, c, owner, name, repo) }},
-			{"community-health", func() auditRow { return auditGitHubCommunityHealth(ctx, c, owner, name, repo) }},
-			{"code-scanning-conflict", func() auditRow { return auditGitHubCodeScanningConflict(ctx, c, owner, name, repo) }},
-			{"ruleset-evaluate-only", func() auditRow { return auditGitHubRulesetEvaluateOnly(ctx, c, owner, name, repo) }},
-			{"workflow-token-permissions", func() auditRow { return auditGitHubWorkflowTokenPermissions(ctx, c, owner, name, repo) }},
-			{"no-merge-method", func() auditRow { return auditGitHubMergeMethods(repo) }},
-			{"fork-policy", func() auditRow { return auditGitHubForkPolicy(repo) }},
-			{"wiki-attack-surface", func() auditRow { return auditGitHubWikiSurface(repo) }},
-			{"dependabot-config", func() auditRow { return auditGitHubDependabotConfig(ctx, c, owner, name, repo) }},
-		}
-		for _, ch := range checks {
-			if want(ch.key) {
-				rows = append(rows, ch.run())
+		g.Go(func() error {
+			ctx := gctx // honor --concurrency and cancellation across the per-repo checks
+			owner, name := splitRepo(repo.GetFullName())
+			checks := []struct {
+				key string
+				run func() auditRow
+			}{
+				{"public-exposure", func() auditRow { return auditGitHubPublicExposure(repo) }},
+				{"stale-repo", func() auditRow { return auditGitHubStaleRepo(repo, o.staleDays) }},
+				{"default-branch", func() auditRow { return auditGitHubDefaultBranch(repo) }},
+				{"merge-hygiene", func() auditRow { return auditGitHubMergeHygiene(repo) }},
+				{"branch-protection-full", func() auditRow { return auditGitHubBranchProtection(ctx, c, owner, name, repo) }},
+				{"signed-commits", func() auditRow { return auditGitHubSignedCommits(ctx, c, owner, name, repo) }},
+				{"required-workflows", func() auditRow { return auditGitHubRequiredWorkflows(ctx, c, owner, name, repo) }},
+				{"actions-fork-pr-permissions", func() auditRow { return auditGitHubForkPRPolicy(ctx, c, owner, name, repo) }},
+				{"environment-protection", func() auditRow { return auditGitHubEnvironments(ctx, c, owner, name, repo) }},
+				{"repo-secrets", func() auditRow {
+					return auditGitHubRepoSecrets(ctx, c, owner, name, repo, o.staleDays, o.showIdentifiers)
+				}},
+				{"deploy-keys", func() auditRow { return auditGitHubDeployKeys(ctx, c, owner, name, repo) }},
+				{"webhooks", func() auditRow { return auditGitHubWebhooks(ctx, c, owner, name, repo) }},
+				{"collaborators", func() auditRow { return auditGitHubCollaborators(ctx, c, owner, name, repo) }},
+				{"vulnerability-alert-count", func() auditRow { return auditGitHubVulnerabilityCounts(ctx, c, owner, name, repo) }},
+				{"code-scanning-alert-count", func() auditRow { return auditGitHubCodeScanningCounts(ctx, c, owner, name, repo) }},
+				{"secret-scanning-alert-count", func() auditRow { return auditGitHubSecretScanningCounts(ctx, c, owner, name, repo) }},
+				{"archived-active-risk", func() auditRow { return auditGitHubArchivedActiveRisk(ctx, c, owner, name, repo) }},
+				{"releases", func() auditRow { return auditGitHubReleases(ctx, c, owner, name, repo) }},
+				{"packages", func() auditRow { return auditGitHubPackages(ctx, c, owner, repo, pc) }},
+				{"dependency-sbom", func() auditRow { return auditGitHubSBOM(ctx, c, owner, name, repo) }},
+				{"dependabot-open-alerts", func() auditRow { return auditGitHubDependabotOpenAlerts(ctx, c, owner, name, repo) }},
+				{"ruleset-bypass", func() auditRow { return auditGitHubRulesetBypass(ctx, c, owner, name, repo) }},
+				{"open-security-advisories", func() auditRow { return auditGitHubOpenSecurityAdvisories(ctx, c, owner, name, repo) }},
+				{"workflow-access-level", func() auditRow { return auditGitHubWorkflowAccessLevel(ctx, c, owner, name, repo) }},
+				{"actions-sha-pinning", func() auditRow { return auditGitHubActionsShaPinning(ctx, c, owner, name, repo) }},
+				{"community-health", func() auditRow { return auditGitHubCommunityHealth(ctx, c, owner, name, repo) }},
+				{"code-scanning-conflict", func() auditRow { return auditGitHubCodeScanningConflict(ctx, c, owner, name, repo) }},
+				{"ruleset-evaluate-only", func() auditRow { return auditGitHubRulesetEvaluateOnly(ctx, c, owner, name, repo) }},
+				{"workflow-token-permissions", func() auditRow { return auditGitHubWorkflowTokenPermissions(ctx, c, owner, name, repo) }},
+				{"no-merge-method", func() auditRow { return auditGitHubMergeMethods(repo) }},
+				{"fork-policy", func() auditRow { return auditGitHubForkPolicy(repo) }},
+				{"wiki-attack-surface", func() auditRow { return auditGitHubWikiSurface(repo) }},
+				{"dependabot-config", func() auditRow { return auditGitHubDependabotConfig(ctx, c, owner, name, repo) }},
 			}
-		}
+			var local []auditRow
+			for _, ch := range checks {
+				if want(ch.key) {
+					local = append(local, ch.run())
+				}
+			}
+			mu.Lock()
+			rows = append(rows, local...)
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 	return rows, nil
 }
@@ -110,6 +131,13 @@ func githubOrgAuditRow(org, key, title, severity string, status ControlStatus, d
 		Detail:      detail,
 		Remediation: remediation,
 	}
+}
+
+func githubOrgAuditErr(org, key, title, severity string, err error, remediation string) auditRow {
+	if endpointUnavailable(err) {
+		return githubOrgAuditRow(org, key, title, severity, StatusSkipped, "unavailable (needs organization admin access, or feature is off)", remediation)
+	}
+	return githubOrgAuditRow(org, key, title, severity, StatusError, err.Error(), remediation)
 }
 
 func githubGlobalAuditRow(key, title, severity string, status ControlStatus, detail, remediation string) auditRow {
@@ -239,6 +267,9 @@ func auditGitHubSignedCommits(ctx context.Context, c *github.Client, owner, name
 }
 
 func auditGitHubRequiredWorkflows(ctx context.Context, c *github.Client, owner, name string, repo *github.Repository) auditRow {
+	if repo.GetOwner().GetType() != "Organization" {
+		return githubAuditRow(repo, "required-workflows", "Required workflows are enforced", "medium", StatusSkipped, "ruleset workflows are only configurable at organization or enterprise level; require CI status checks instead", "For organization repositories, use an organization ruleset to require critical workflows.")
+	}
 	rules, err := githubActiveRuleTypes(ctx, c, owner, name, repo.GetDefaultBranch())
 	if err != nil {
 		if endpointUnavailable(err) {
@@ -255,8 +286,30 @@ func auditGitHubRequiredWorkflows(ctx context.Context, c *github.Client, owner, 
 // returns the rule types active rulesets enforce on the branch.
 // the list endpoint drops rules/conditions, so we fetch each ruleset's detail and
 // only count ones whose ref conditions actually cover this branch.
+// allRepoRulesets pages through every repository ruleset; GetAllRulesets returns
+// only the first page, so rulesets past page 1 (>30) would otherwise be missed.
+func allRepoRulesets(ctx context.Context, c *github.Client, owner, name string, includeParents bool) ([]*github.RepositoryRuleset, error) {
+	opts := &github.RepositoryListRulesetsOptions{ListOptions: github.ListOptions{PerPage: 100}}
+	if includeParents {
+		opts.IncludesParents = github.Ptr(true)
+	}
+	var all []*github.RepositoryRuleset
+	for {
+		sets, resp, err := c.Repositories.GetAllRulesets(ctx, owner, name, opts)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, sets...)
+		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return all, nil
+}
+
 func githubActiveRuleTypes(ctx context.Context, c *github.Client, owner, name, branch string) (map[string]bool, error) {
-	sets, _, err := c.Repositories.GetAllRulesets(ctx, owner, name, &github.RepositoryListRulesetsOptions{IncludesParents: github.Ptr(true)})
+	sets, err := allRepoRulesets(ctx, c, owner, name, true)
 	if err != nil {
 		return nil, err
 	}
@@ -269,7 +322,13 @@ func githubActiveRuleTypes(ctx context.Context, c *github.Client, owner, name, b
 			continue // only branch rulesets protect a branch
 		}
 		full, _, err := c.Repositories.GetRuleset(ctx, owner, name, summary.GetID(), true)
-		if err != nil || full == nil || full.Rules == nil || !rulesetTargetsBranch(full, branch) {
+		if err != nil {
+			return nil, fmt.Errorf("read ruleset %d: %w", summary.GetID(), err)
+		}
+		if full == nil {
+			return nil, fmt.Errorf("read ruleset %d: empty response", summary.GetID())
+		}
+		if full.Rules == nil || !rulesetTargetsBranch(full, branch) {
 			continue
 		}
 		r := full.Rules
@@ -329,8 +388,10 @@ func rulesetTargetsBranch(rs *github.RepositoryRuleset, branch string) bool {
 // matches a GitHub ruleset ref pattern against a branch ref.
 func refPatternMatches(pattern, ref, branch string) bool {
 	switch pattern {
-	case "~ALL", "~DEFAULT_BRANCH":
+	case "~ALL":
 		return true
+	case "~DEFAULT_BRANCH":
+		return branch != ""
 	}
 	if branch == "" {
 		return false
@@ -340,40 +401,36 @@ func refPatternMatches(pattern, ref, branch string) bool {
 
 // GitHub fnmatch-style ref matching: "*" stays in a segment, "**" crosses "/", "?" is one non-"/" char.
 func globMatch(pattern, s string) bool {
-	if pattern == "" {
-		return s == ""
+	patternRunes := []rune(pattern)
+	valueRunes := []rune(s)
+	type state struct{ pattern, value int }
+	memo := map[state]bool{}
+	seen := map[state]bool{}
+	var match func(int, int) bool
+	match = func(pi, si int) bool {
+		key := state{pi, si}
+		if seen[key] {
+			return memo[key]
+		}
+		seen[key] = true
+		var result bool
+		switch {
+		case pi == len(patternRunes):
+			result = si == len(valueRunes)
+		case patternRunes[pi] == '*' && pi+1 < len(patternRunes) && patternRunes[pi+1] == '*':
+			result = match(pi+2, si) || (si < len(valueRunes) && match(pi, si+1))
+		case patternRunes[pi] == '*':
+			result = match(pi+1, si) ||
+				(si < len(valueRunes) && valueRunes[si] != '/' && match(pi, si+1))
+		case patternRunes[pi] == '?':
+			result = si < len(valueRunes) && valueRunes[si] != '/' && match(pi+1, si+1)
+		default:
+			result = si < len(valueRunes) && patternRunes[pi] == valueRunes[si] && match(pi+1, si+1)
+		}
+		memo[key] = result
+		return result
 	}
-	switch pattern[0] {
-	case '*':
-		if len(pattern) > 1 && pattern[1] == '*' {
-			rest := pattern[2:]
-			for i := 0; i <= len(s); i++ { // ** eats anything, including "/"
-				if globMatch(rest, s[i:]) {
-					return true
-				}
-			}
-			return false
-		}
-		for i := 0; i <= len(s); i++ { // * doesn't cross "/"
-			if globMatch(pattern[1:], s[i:]) {
-				return true
-			}
-			if i < len(s) && s[i] == '/' {
-				break
-			}
-		}
-		return false
-	case '?':
-		if s == "" || s[0] == '/' {
-			return false
-		}
-		return globMatch(pattern[1:], s[1:])
-	default:
-		if s == "" || s[0] != pattern[0] {
-			return false
-		}
-		return globMatch(pattern[1:], s[1:])
-	}
+	return match(0, 0)
 }
 
 func branchProtectionMissing(p *github.Protection, rules map[string]bool) []string {
@@ -415,7 +472,9 @@ func auditGitHubForkPRPolicy(ctx context.Context, c *github.Client, owner, name 
 		return githubAuditRow(repo, "actions-fork-pr-permissions", "Fork PR approval policy is restrictive", "medium", StatusError, err.Error(), "Require approval before running workflows from fork pull requests.")
 	}
 	switch out.ApprovalPolicy {
-	case "first_time_contributors_new_to_github", "first_time_contributors":
+	// all_external_contributors is the strictest policy (approval for every external
+	// contributor), so it must count as compliant, not a gap.
+	case "first_time_contributors_new_to_github", "first_time_contributors", "all_external_contributors":
 		return githubAuditRow(repo, "actions-fork-pr-permissions", "Fork PR approval policy is restrictive", "medium", StatusCompliant, "approval policy: "+out.ApprovalPolicy, "Require approval before running workflows from fork pull requests.")
 	default:
 		return githubAuditRow(repo, "actions-fork-pr-permissions", "Fork PR approval policy is restrictive", "medium", StatusGap, "approval policy: "+out.ApprovalPolicy, "Require approval before running workflows from fork pull requests.")
@@ -448,7 +507,7 @@ func auditGitHubEnvironments(ctx context.Context, c *github.Client, owner, name 
 	return githubAuditRow(repo, "environment-protection", "Deployment environments are protected", "medium", StatusCompliant, fmt.Sprintf("%d environments reviewed", len(envs)), "Add required reviewers or branch policies to production-like environments.")
 }
 
-func auditGitHubRepoSecrets(ctx context.Context, c *github.Client, owner, name string, repo *github.Repository, staleDays int) auditRow {
+func auditGitHubRepoSecrets(ctx context.Context, c *github.Client, owner, name string, repo *github.Repository, staleDays int, showIdentifiers bool) auditRow {
 	secrets, total, err := listGitHubRepoSecrets(ctx, c, owner, name)
 	if err != nil {
 		return githubAuditErr(repo, "repo-secrets", "Repository secrets are reviewed and rotated", "medium", err, "Rotate stale secrets and move shared secrets to org or environment scope where possible.")
@@ -461,7 +520,11 @@ func auditGitHubRepoSecrets(ctx context.Context, c *github.Client, owner, name s
 		}
 	}
 	if len(stale) > 0 {
-		return githubAuditRow(repo, "repo-secrets", "Repository secrets are reviewed and rotated", "medium", StatusGap, fmt.Sprintf("%d stale secrets: %s", len(stale), strings.Join(limitStrings(stale, maxDetailItems), ", ")), "Rotate stale secrets and move shared secrets to org or environment scope where possible.")
+		detail := fmt.Sprintf("%d stale repository secrets", len(stale))
+		if showIdentifiers {
+			detail += ": " + strings.Join(limitStrings(stale, maxDetailItems), ", ")
+		}
+		return githubAuditRow(repo, "repo-secrets", "Repository secrets are reviewed and rotated", "medium", StatusGap, detail, "Rotate stale secrets and move shared secrets to org or environment scope where possible.")
 	}
 	return githubAuditRow(repo, "repo-secrets", "Repository secrets are reviewed and rotated", "medium", StatusCompliant, fmt.Sprintf("%d repository secrets", total), "Rotate stale secrets and move shared secrets to org or environment scope where possible.")
 }
@@ -519,6 +582,9 @@ func auditGitHubCollaborators(ctx context.Context, c *github.Client, owner, name
 	}
 	admins, adminErr := listGitHubCollaborators(ctx, c, owner, name, github.ListCollaboratorsOptions{Permission: "admin"})
 	if adminErr != nil {
+		if endpointUnavailable(adminErr) {
+			return githubAuditRow(repo, "collaborators", "Outside collaborators are minimized", "medium", StatusSkipped, "admin collaborators unavailable", "Remove stale outside collaborators and review direct admin access.")
+		}
 		return githubAuditRow(repo, "collaborators", "Outside collaborators are minimized", "medium", StatusError, adminErr.Error(), "Remove stale outside collaborators and review direct admin access.")
 	}
 	if len(outside) > 0 {
@@ -615,16 +681,45 @@ type githubPackageListResult struct {
 	err           error
 }
 
+// githubPackageCache memoizes per-owner package listings; safe for the parallel
+// per-repo audit loop.
+type githubPackageCache struct {
+	mu sync.Mutex
+	m  map[string]*githubPackageCacheEntry
+}
+
+type githubPackageCacheEntry struct {
+	done   chan struct{}
+	result githubPackageListResult
+}
+
+func (pc *githubPackageCache) get(ctx context.Context, c *github.Client, owner string, repo *github.Repository) githubPackageListResult {
+	ownerType := repo.GetOwner().GetType()
+	key := ownerType + "/" + owner
+	pc.mu.Lock()
+	entry, ok := pc.m[key]
+	if ok {
+		pc.mu.Unlock()
+		select {
+		case <-entry.done:
+			return entry.result
+		case <-ctx.Done():
+			return githubPackageListResult{err: ctx.Err()}
+		}
+	}
+	entry = &githubPackageCacheEntry{done: make(chan struct{})}
+	pc.m[key] = entry
+	pc.mu.Unlock()
+
+	entry.result = listGitHubOwnerPackages(ctx, c, owner, ownerType == "Organization")
+	close(entry.done)
+	return entry.result
+}
+
 var githubPackageTypes = []string{"container", "docker", "npm", "maven", "nuget", "rubygems"}
 
-func auditGitHubPackages(ctx context.Context, c *github.Client, owner string, repo *github.Repository, cache map[string]githubPackageListResult) auditRow {
-	ownerType := repo.GetOwner().GetType()
-	cacheKey := ownerType + "/" + owner
-	result, ok := cache[cacheKey]
-	if !ok {
-		result = listGitHubOwnerPackages(ctx, c, owner, ownerType == "Organization")
-		cache[cacheKey] = result
-	}
+func auditGitHubPackages(ctx context.Context, c *github.Client, owner string, repo *github.Repository, cache *githubPackageCache) auditRow {
+	result := cache.get(ctx, c, owner, repo)
 	if result.err != nil {
 		return githubAuditRow(repo, "packages", "GitHub Packages are inventoried", "low", StatusError, result.err.Error(), "Review package visibility, stale versions, and repository package permissions.")
 	}
@@ -696,6 +791,9 @@ func listGitHubOwnerPackages(ctx context.Context, c *github.Client, owner string
 func auditGitHubSBOM(ctx context.Context, c *github.Client, owner, name string, repo *github.Repository) auditRow {
 	var out map[string]any
 	if err := githubRawGet(ctx, c, fmt.Sprintf("repos/%s/%s/dependency-graph/sbom", owner, name), &out); err != nil {
+		if githubStatus(err) == http.StatusForbidden {
+			return githubAuditRow(repo, "dependency-sbom", "Dependency graph SBOM is available", "medium", StatusSkipped, "SBOM endpoint forbidden (needs access)", "Enable dependency graph/SBOM support and commit lockfiles where relevant.")
+		}
 		if githubStatus(err) == http.StatusNotFound {
 			return githubAuditRow(repo, "dependency-sbom", "Dependency graph SBOM is available", "medium", StatusGap, "SBOM endpoint unavailable", "Enable dependency graph/SBOM support and commit lockfiles where relevant.")
 		}
@@ -757,7 +855,7 @@ func auditGitHubDependabotConfig(ctx context.Context, c *github.Client, owner, n
 	return githubAuditRow(repo, key, title, "low", StatusGap, "no .github/dependabot.yml (report-only)", rem)
 }
 
-func auditGitHubOrganizations(ctx context.Context, c *github.Client, repos []*github.Repository, want func(string) bool) []auditRow {
+func auditGitHubOrganizations(ctx context.Context, c *github.Client, repos []*github.Repository, want func(string) bool, showIdentifiers bool) []auditRow {
 	orgs := map[string]bool{}
 	for _, repo := range repos {
 		owner := repo.GetOwner()
@@ -779,7 +877,7 @@ func auditGitHubOrganizations(ctx context.Context, c *github.Client, repos []*gi
 			rows = append(rows, auditGitHubOrgTokenPolicy(ctx, c, org))
 		}
 		if want("org-secrets") {
-			rows = append(rows, auditGitHubOrgSecrets(ctx, c, org))
+			rows = append(rows, auditGitHubOrgSecrets(ctx, c, org, showIdentifiers))
 		}
 		if want("org-webhooks") {
 			rows = append(rows, auditGitHubOrgWebhooks(ctx, c, org))
@@ -810,7 +908,7 @@ func auditGitHubOrg2FA(org string, info *github.Organization, err error) auditRo
 		rem   = "Require two-factor authentication for all organization members."
 	)
 	if err != nil {
-		return githubOrgAuditRow(org, key, title, "high", StatusError, err.Error(), rem)
+		return githubOrgAuditErr(org, key, title, "high", err, rem)
 	}
 	if info == nil {
 		return githubOrgAuditRow(org, key, title, "high", StatusSkipped, "organization details unavailable", rem)
@@ -831,7 +929,7 @@ func auditGitHubOrgBasePermission(org string, info *github.Organization, err err
 		rem   = "Set base permissions to read or none and restrict public repository creation by members."
 	)
 	if err != nil {
-		return githubOrgAuditRow(org, key, title, "medium", StatusError, err.Error(), rem)
+		return githubOrgAuditErr(org, key, title, "medium", err, rem)
 	}
 	if info == nil {
 		return githubOrgAuditRow(org, key, title, "medium", StatusSkipped, "organization details unavailable", rem)
@@ -843,11 +941,14 @@ func auditGitHubOrgBasePermission(org string, info *github.Organization, err err
 	if perm := info.GetDefaultRepoPermission(); perm == "write" || perm == "admin" {
 		issues = append(issues, "base permission: "+perm)
 	}
-	if info.GetMembersCanCreatePublicRepos() {
+	if info.MembersCanCreatePublicRepos != nil && info.GetMembersCanCreatePublicRepos() {
 		issues = append(issues, "members can create public repos")
 	}
 	if len(issues) > 0 {
 		return githubOrgAuditRow(org, key, title, "medium", StatusGap, strings.Join(issues, "; "), rem)
+	}
+	if info.MembersCanCreatePublicRepos == nil {
+		return githubOrgAuditRow(org, key, title, "medium", StatusSkipped, "public repository creation setting not visible", rem)
 	}
 	return githubOrgAuditRow(org, key, title, "medium", StatusCompliant, "base permission: "+info.GetDefaultRepoPermission(), rem)
 }
@@ -886,7 +987,7 @@ func auditGitHubRulesetBypass(ctx context.Context, c *github.Client, owner, name
 		title = "Branch rulesets have no bypass actors"
 		rem   = "Remove or tighten ruleset bypass actors that let roles skip branch protection."
 	)
-	sets, _, err := c.Repositories.GetAllRulesets(ctx, owner, name, &github.RepositoryListRulesetsOptions{IncludesParents: github.Ptr(true)})
+	sets, err := allRepoRulesets(ctx, c, owner, name, true)
 	if err != nil {
 		return githubAuditErr(repo, key, title, "medium", err, rem)
 	}
@@ -950,29 +1051,47 @@ func auditGitHubOrgActionsPolicy(ctx context.Context, c *github.Client, org stri
 	const rem = "Restrict the org Actions policy: avoid allowing all actions, prefer a GitHub-owned + verified allowlist, and require SHA pinning."
 	p, _, err := c.Actions.GetActionsPermissions(ctx, org)
 	if err != nil {
-		return githubOrgAuditRow(org, "org-actions-policy", "Organization Actions policy is restricted", "high", StatusError, err.Error(), rem)
+		return githubOrgAuditErr(org, "org-actions-policy", "Organization Actions policy is restricted", "high", err, rem)
 	}
 	if p == nil {
 		return githubOrgAuditRow(org, "org-actions-policy", "Organization Actions policy is restricted", "high", StatusSkipped, "org Actions policy not visible", rem)
+	}
+	if p.AllowedActions == nil || strings.TrimSpace(p.GetAllowedActions()) == "" ||
+		p.EnabledRepositories == nil || strings.TrimSpace(p.GetEnabledRepositories()) == "" {
+		return githubOrgAuditRow(org, "org-actions-policy", "Organization Actions policy is restricted", "high", StatusSkipped, "org Actions policy fields are incomplete", rem)
 	}
 	var issues []string
 	switch p.GetAllowedActions() {
 	case "all":
 		issues = append(issues, "all actions allowed (no allowlist)")
 	case "selected":
-		if allowed, _, aerr := c.Actions.GetActionsAllowed(ctx, org); aerr == nil {
-			if !allowed.GetGithubOwnedAllowed() || !allowed.GetVerifiedAllowed() {
-				issues = append(issues, "allowlist does not require GitHub-owned + verified")
-			}
-			if len(allowed.PatternsAllowed) > 0 {
-				issues = append(issues, "allowlist includes custom patterns")
-			}
+		allowed, _, aerr := c.Actions.GetActionsAllowed(ctx, org)
+		if aerr != nil {
+			return githubOrgAuditErr(org, "org-actions-policy", "Organization Actions policy is restricted", "high", aerr, rem)
 		}
+		if allowed == nil {
+			return githubOrgAuditRow(org, "org-actions-policy", "Organization Actions policy is restricted", "high", StatusSkipped, "org Actions allowlist details are empty", rem)
+		}
+		if !allowed.GetGithubOwnedAllowed() || !allowed.GetVerifiedAllowed() {
+			issues = append(issues, "allowlist does not require GitHub-owned + verified")
+		}
+		if len(allowed.PatternsAllowed) > 0 {
+			issues = append(issues, "allowlist includes custom patterns")
+		}
+	case "local_only":
+		// Local actions only is stricter than this baseline.
+	default:
+		return githubOrgAuditRow(org, "org-actions-policy", "Organization Actions policy is restricted", "high", StatusError, "unknown allowed_actions value: "+p.GetAllowedActions(), rem)
 	}
 	if p.GetEnabledRepositories() == "all" {
 		issues = append(issues, "actions enabled on all repositories")
 	}
-	if p.SHAPinningRequired != nil && !p.GetSHAPinningRequired() {
+	if p.SHAPinningRequired == nil {
+		if len(issues) == 0 {
+			return githubOrgAuditRow(org, "org-actions-policy", "Organization Actions policy is restricted", "high", StatusSkipped, "SHA pinning setting not visible", rem)
+		}
+		issues = append(issues, "SHA pinning setting not visible")
+	} else if !p.GetSHAPinningRequired() {
 		issues = append(issues, "SHA pinning not required")
 	}
 	if len(issues) > 0 {
@@ -984,7 +1103,7 @@ func auditGitHubOrgActionsPolicy(ctx context.Context, c *github.Client, org stri
 func auditGitHubOrgTokenPolicy(ctx context.Context, c *github.Client, org string) auditRow {
 	p, _, err := c.Actions.GetDefaultWorkflowPermissionsInOrganization(ctx, org)
 	if err != nil {
-		return githubOrgAuditRow(org, "org-token-policy", "Organization default GITHUB_TOKEN is read-only", "high", StatusError, err.Error(), "Set organization default workflow token permissions to read and prevent PR approval.")
+		return githubOrgAuditErr(org, "org-token-policy", "Organization default GITHUB_TOKEN is read-only", "high", err, "Set organization default workflow token permissions to read and prevent PR approval.")
 	}
 	if p.GetDefaultWorkflowPermissions() == "read" && !p.GetCanApprovePullRequestReviews() {
 		return githubOrgAuditRow(org, "org-token-policy", "Organization default GITHUB_TOKEN is read-only", "high", StatusCompliant, "default token is read-only", "Set organization default workflow token permissions to read and prevent PR approval.")
@@ -992,10 +1111,10 @@ func auditGitHubOrgTokenPolicy(ctx context.Context, c *github.Client, org string
 	return githubOrgAuditRow(org, "org-token-policy", "Organization default GITHUB_TOKEN is read-only", "high", StatusGap, fmt.Sprintf("token=%s can_approve_pr=%v", p.GetDefaultWorkflowPermissions(), p.GetCanApprovePullRequestReviews()), "Set organization default workflow token permissions to read and prevent PR approval.")
 }
 
-func auditGitHubOrgSecrets(ctx context.Context, c *github.Client, org string) auditRow {
+func auditGitHubOrgSecrets(ctx context.Context, c *github.Client, org string, showIdentifiers bool) auditRow {
 	secrets, total, err := listGitHubOrgSecrets(ctx, c, org)
 	if err != nil {
-		return githubOrgAuditRow(org, "org-secrets", "Organization secrets are scoped narrowly", "medium", StatusError, err.Error(), "Scope org secrets to selected repositories and rotate stale secrets.")
+		return githubOrgAuditErr(org, "org-secrets", "Organization secrets are scoped narrowly", "medium", err, "Scope org secrets to selected repositories and rotate stale secrets.")
 	}
 	var allRepo []string
 	for _, secret := range secrets {
@@ -1004,7 +1123,11 @@ func auditGitHubOrgSecrets(ctx context.Context, c *github.Client, org string) au
 		}
 	}
 	if len(allRepo) > 0 {
-		return githubOrgAuditRow(org, "org-secrets", "Organization secrets are scoped narrowly", "medium", StatusGap, "secrets visible to all repos: "+strings.Join(limitStrings(allRepo, maxDetailItems), ", "), "Scope org secrets to selected repositories and rotate stale secrets.")
+		detail := fmt.Sprintf("%d organization secrets are visible to all repositories", len(allRepo))
+		if showIdentifiers {
+			detail += ": " + strings.Join(limitStrings(allRepo, maxDetailItems), ", ")
+		}
+		return githubOrgAuditRow(org, "org-secrets", "Organization secrets are scoped narrowly", "medium", StatusGap, detail, "Scope org secrets to selected repositories and rotate stale secrets.")
 	}
 	return githubOrgAuditRow(org, "org-secrets", "Organization secrets are scoped narrowly", "medium", StatusCompliant, fmt.Sprintf("%d org secrets reviewed", total), "Scope org secrets to selected repositories and rotate stale secrets.")
 }
@@ -1012,7 +1135,7 @@ func auditGitHubOrgSecrets(ctx context.Context, c *github.Client, org string) au
 func auditGitHubOrgWebhooks(ctx context.Context, c *github.Client, org string) auditRow {
 	hooks, err := listGitHubOrgHooks(ctx, c, org)
 	if err != nil {
-		return githubOrgAuditRow(org, "org-webhooks", "Organization webhooks are reviewed", "medium", StatusError, err.Error(), "Remove stale org webhooks and require HTTPS.")
+		return githubOrgAuditErr(org, "org-webhooks", "Organization webhooks are reviewed", "medium", err, "Remove stale org webhooks and require HTTPS.")
 	}
 	var weak []string
 	for _, hook := range hooks {
@@ -1081,7 +1204,7 @@ func auditGitHubWorkflowAccessLevel(ctx context.Context, c *github.Client, owner
 		rem   = "Set Actions access level to 'none' unless other repositories must reuse this repo's workflows."
 	)
 	var out struct {
-		AccessLevel string `json:"access_level"`
+		AccessLevel *string `json:"access_level"`
 	}
 	if err := githubRawGet(ctx, c, fmt.Sprintf("repos/%s/%s/actions/permissions/access", owner, name), &out); err != nil {
 		if endpointUnavailable(err) {
@@ -1089,13 +1212,19 @@ func auditGitHubWorkflowAccessLevel(ctx context.Context, c *github.Client, owner
 		}
 		return githubAuditRow(repo, key, title, "low", StatusError, err.Error(), rem)
 	}
-	if out.AccessLevel == "" {
-		out.AccessLevel = "none"
+	if out.AccessLevel == nil || strings.TrimSpace(*out.AccessLevel) == "" {
+		return githubAuditRow(repo, key, title, "low", StatusSkipped, "Actions access level is not visible", rem)
 	}
-	if out.AccessLevel == "none" {
+	level := strings.TrimSpace(*out.AccessLevel)
+	if level == "none" {
 		return githubAuditRow(repo, key, title, "low", StatusCompliant, "access level: none", rem)
 	}
-	return githubAuditRow(repo, key, title, "low", StatusGap, "access level: "+out.AccessLevel+" (other repos can reuse this repo's actions; tighten to none unless intended)", rem)
+	switch level {
+	case "user", "organization", "enterprise":
+		return githubAuditRow(repo, key, title, "low", StatusGap, "access level: "+level+" (other repos can reuse this repo's actions; tighten to none unless intended)", rem)
+	default:
+		return githubAuditRow(repo, key, title, "low", StatusError, "unknown Actions access level: "+level, rem)
+	}
 }
 
 func auditGitHubActionsShaPinning(ctx context.Context, c *github.Client, owner, name string, repo *github.Repository) auditRow {
@@ -1110,6 +1239,9 @@ func auditGitHubActionsShaPinning(ctx context.Context, c *github.Client, owner, 
 			return githubAuditRow(repo, key, title, "medium", StatusSkipped, "Actions permissions API unavailable", rem)
 		}
 		return githubAuditRow(repo, key, title, "medium", StatusError, err.Error(), rem)
+	}
+	if p == nil || p.Enabled == nil {
+		return githubAuditRow(repo, key, title, "medium", StatusSkipped, "Actions enabled setting not visible", rem)
 	}
 	if !p.GetEnabled() {
 		return githubAuditRow(repo, key, title, "medium", StatusSkipped, "Actions disabled for this repository", rem)
@@ -1159,161 +1291,6 @@ func auditGitHubCommunityHealth(ctx context.Context, c *github.Client, owner, na
 	return githubAuditRow(repo, key, title, "low", StatusCompliant, fmt.Sprintf("community health %d%%", m.GetHealthPercentage()), rem)
 }
 
-func auditGitHubCodeScanningConflict(ctx context.Context, c *github.Client, owner, name string, repo *github.Repository) auditRow {
-	const (
-		key   = "code-scanning-conflict"
-		title = "No conflicting code-scanning setups"
-		rem   = "Use either CodeQL default setup OR an advanced workflow, not both — GitHub rejects advanced SARIF uploads when default setup is on."
-	)
-	cfg, _, err := c.CodeScanning.GetDefaultSetupConfiguration(ctx, owner, name)
-	if err != nil {
-		if endpointUnavailable(err) {
-			return githubAuditRow(repo, key, title, "medium", StatusSkipped, "code scanning API unavailable", rem)
-		}
-		return githubAuditRow(repo, key, title, "medium", StatusError, err.Error(), rem)
-	}
-	if cfg.GetState() != "configured" {
-		return githubAuditRow(repo, key, title, "medium", StatusCompliant, "default setup not enabled (no conflict possible)", rem)
-	}
-	uses, err := workflowsUsingCodeQL(ctx, c, owner, name, repo.GetDefaultBranch())
-	if err != nil {
-		if endpointUnavailable(err) {
-			return githubAuditRow(repo, key, title, "medium", StatusSkipped, "default setup on; workflows not readable", rem)
-		}
-		return githubAuditRow(repo, key, title, "medium", StatusError, err.Error(), rem)
-	}
-	if len(uses) > 0 {
-		return githubAuditRow(repo, key, title, "medium", StatusGap, "default setup on AND advanced workflow(s) run codeql-action: "+strings.Join(limitStrings(uses, maxDetailItems), ", ")+" (their SARIF uploads will be rejected)", rem)
-	}
-	return githubAuditRow(repo, key, title, "medium", StatusCompliant, "default setup on; no conflicting advanced workflow", rem)
-}
-
-// returns filename->content for each *.yml/*.yaml under .github/workflows.
-func listWorkflowFiles(ctx context.Context, c *github.Client, owner, name, branch string) (map[string]string, error) {
-	var opt *github.RepositoryContentGetOptions
-	if branch != "" {
-		opt = &github.RepositoryContentGetOptions{Ref: branch}
-	}
-	_, dir, _, err := c.Repositories.GetContents(ctx, owner, name, ".github/workflows", opt)
-	if err != nil {
-		if githubStatus(err) == http.StatusNotFound {
-			return nil, nil
-		}
-		return nil, err
-	}
-	out := map[string]string{}
-	for _, entry := range dir {
-		if entry.GetType() != "file" {
-			continue
-		}
-		lower := strings.ToLower(entry.GetName())
-		if !strings.HasSuffix(lower, ".yml") && !strings.HasSuffix(lower, ".yaml") {
-			continue
-		}
-		file, _, _, err := c.Repositories.GetContents(ctx, owner, name, entry.GetPath(), opt)
-		if err != nil || file == nil {
-			continue
-		}
-		if content, err := file.GetContent(); err == nil {
-			out[entry.GetName()] = content
-		}
-	}
-	return out, nil
-}
-
-// returns workflow filenames that reference github/codeql-action.
-func workflowsUsingCodeQL(ctx context.Context, c *github.Client, owner, name, branch string) ([]string, error) {
-	files, err := listWorkflowFiles(ctx, c, owner, name, branch)
-	if err != nil {
-		return nil, err
-	}
-	var found []string
-	for fname, content := range files {
-		if strings.Contains(content, "github/codeql-action") {
-			found = append(found, fname)
-		}
-	}
-	return found, nil
-}
-
-func auditGitHubWorkflowTokenPermissions(ctx context.Context, c *github.Client, owner, name string, repo *github.Repository) auditRow {
-	const (
-		key   = "workflow-token-permissions"
-		title = "Workflows set least-privilege GITHUB_TOKEN permissions"
-		rem   = "Add a top-level `permissions:` block (e.g. `contents: read`) to each workflow so GITHUB_TOKEN is least-privilege, not the broad default."
-	)
-	files, err := listWorkflowFiles(ctx, c, owner, name, repo.GetDefaultBranch())
-	if err != nil {
-		if endpointUnavailable(err) {
-			return githubAuditRow(repo, key, title, "high", StatusSkipped, "workflows not readable", rem)
-		}
-		return githubAuditRow(repo, key, title, "high", StatusError, err.Error(), rem)
-	}
-	if len(files) == 0 {
-		return githubAuditRow(repo, key, title, "high", StatusCompliant, "no Actions workflows", rem)
-	}
-	var weak []string
-	for fname, content := range files {
-		if issue := workflowPermissionIssue(content); issue != "" {
-			weak = append(weak, fname+" ("+issue+")")
-		}
-	}
-	if len(weak) > 0 {
-		sort.Strings(weak)
-		return githubAuditRow(repo, key, title, "high", StatusGap, "workflows without least-privilege token permissions: "+strings.Join(limitStrings(weak, maxDetailItems), ", "), rem)
-	}
-	return githubAuditRow(repo, key, title, "high", StatusCompliant, fmt.Sprintf("all %d workflow(s) declare explicit token permissions", len(files)), rem)
-}
-
-// returns "" if the workflow keeps GITHUB_TOKEN least-privilege, else what's wrong (or "unparseable").
-func workflowPermissionIssue(content string) string {
-	var wf struct {
-		Permissions any `yaml:"permissions"`
-		Jobs        map[string]struct {
-			Permissions any `yaml:"permissions"`
-		} `yaml:"jobs"`
-	}
-	if err := yaml.Unmarshal([]byte(content), &wf); err != nil {
-		return "unparseable"
-	}
-	if wf.Permissions != nil {
-		return permTooBroad(wf.Permissions) // explicit top-level permissions
-	}
-	// no top-level permissions, so every job has to set its own
-	if len(wf.Jobs) == 0 {
-		return "no explicit permissions"
-	}
-	for _, j := range wf.Jobs {
-		if j.Permissions == nil {
-			return "no explicit permissions"
-		}
-		if issue := permTooBroad(j.Permissions); issue != "" {
-			return issue
-		}
-	}
-	return ""
-}
-
-// returns "" if the permissions value is least-privilege, else why it's too broad.
-func permTooBroad(p any) string {
-	switch v := p.(type) {
-	case string:
-		if v == "write-all" {
-			return "write-all token"
-		}
-		return "" // read-all / none
-	case map[string]any:
-		for k, val := range v {
-			if s, ok := val.(string); ok && s == "write" {
-				return "write permission: " + k
-			}
-		}
-		return ""
-	default:
-		return ""
-	}
-}
-
 func auditGitHubRulesetEvaluateOnly(ctx context.Context, c *github.Client, owner, name string, repo *github.Repository) auditRow {
 	const (
 		key   = "ruleset-evaluate-only"
@@ -1324,7 +1301,7 @@ func auditGitHubRulesetEvaluateOnly(ctx context.Context, c *github.Client, owner
 	if branch == "" {
 		return githubAuditRow(repo, key, title, "high", StatusSkipped, "no default branch", rem)
 	}
-	sets, _, err := c.Repositories.GetAllRulesets(ctx, owner, name, &github.RepositoryListRulesetsOptions{IncludesParents: github.Ptr(true)})
+	sets, err := allRepoRulesets(ctx, c, owner, name, true)
 	if err != nil {
 		if endpointUnavailable(err) {
 			return githubAuditRow(repo, key, title, "high", StatusSkipped, "rulesets API unavailable", rem)
@@ -1340,7 +1317,16 @@ func auditGitHubRulesetEvaluateOnly(ctx context.Context, c *github.Client, owner
 			continue
 		}
 		full, _, err := c.Repositories.GetRuleset(ctx, owner, name, rs.GetID(), true)
-		if err != nil || full == nil || !rulesetTargetsBranch(full, branch) {
+		if err != nil {
+			if endpointUnavailable(err) {
+				return githubAuditRow(repo, key, title, "high", StatusSkipped, "could not read evaluate-only ruleset details", rem)
+			}
+			return githubAuditRow(repo, key, title, "high", StatusError, err.Error(), rem)
+		}
+		if full == nil {
+			return githubAuditRow(repo, key, title, "high", StatusSkipped, "empty evaluate-only ruleset response", rem)
+		}
+		if !rulesetTargetsBranch(full, branch) {
 			continue
 		}
 		evalOnly = append(evalOnly, rs.Name)
@@ -1373,8 +1359,14 @@ func auditGitHubForkPolicy(repo *github.Repository) auditRow {
 		title = "Forking is disabled on private repositories"
 		rem   = "Disable forking on private/internal repos to reduce the risk of code leaving controlled repositories."
 	)
+	if repo.Private == nil {
+		return githubAuditRow(repo, key, title, "low", StatusSkipped, "repository visibility not visible", rem)
+	}
 	if !repo.GetPrivate() {
 		return githubAuditRow(repo, key, title, "low", StatusCompliant, "public repository (forking policy n/a)", rem)
+	}
+	if repo.AllowForking == nil {
+		return githubAuditRow(repo, key, title, "low", StatusSkipped, "private repository forking setting not visible", rem)
 	}
 	if repo.GetAllowForking() {
 		return githubAuditRow(repo, key, title, "low", StatusGap, "private repository allows forking", rem)
@@ -1388,6 +1380,9 @@ func auditGitHubWikiSurface(repo *github.Repository) auditRow {
 		title = "Public repository wiki surface is reviewed"
 		rem   = "Disable the wiki on public repos, or restrict who can edit it, to remove a low-visibility editable surface."
 	)
+	if repo.Private == nil || repo.HasWiki == nil {
+		return githubAuditRow(repo, key, title, "low", StatusSkipped, "repository visibility or wiki setting not visible", rem)
+	}
 	if !repo.GetPrivate() && repo.GetHasWiki() {
 		return githubAuditRow(repo, key, title, "low", StatusGap, "public repository has an open, editable wiki", rem)
 	}

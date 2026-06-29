@@ -68,7 +68,7 @@ func TestGitHubPackagesAuditFlagsPublicPackageLinkedToPrivateRepo(t *testing.T) 
 		Owner:    &github.User{Login: github.Ptr("me"), Type: github.Ptr("User")},
 	}
 
-	row := auditGitHubPackages(context.Background(), client, "me", repo, map[string]githubPackageListResult{})
+	row := auditGitHubPackages(context.Background(), client, "me", repo, &githubPackageCache{m: map[string]*githubPackageCacheEntry{}})
 	if row.Status != string(StatusGap) {
 		t.Fatalf("status = %s detail=%q, want gap", row.Status, row.Detail)
 	}
@@ -136,6 +136,14 @@ func TestGitHubWorkflowAccessLevelStrictness(t *testing.T) {
 	check("none", StatusCompliant)
 	check("user", StatusGap)
 	check("organization", StatusGap)
+
+	missing := mockClient(map[string]string{
+		"GET /repos/me/app/actions/permissions/access": `{}`,
+	})
+	row := auditGitHubWorkflowAccessLevel(context.Background(), missing, "me", "app", &github.Repository{FullName: github.Ptr("me/app")})
+	if row.Status != string(StatusSkipped) {
+		t.Fatalf("missing access_level: got %s, want skipped", row.Status)
+	}
 }
 
 func TestGitHubCommunityHealthFlagsMissing(t *testing.T) {
@@ -148,6 +156,34 @@ func TestGitHubCommunityHealthFlagsMissing(t *testing.T) {
 	}
 	if !strings.Contains(row.Detail, "issue template") {
 		t.Fatalf("detail = %q, want missing issue template", row.Detail)
+	}
+}
+
+func TestGitHubRequiredWorkflowsSkipsPersonalRepository(t *testing.T) {
+	repo := &github.Repository{
+		FullName: github.Ptr("me/app"),
+		Owner:    &github.User{Type: github.Ptr("User")},
+	}
+	row := auditGitHubRequiredWorkflows(context.Background(), nil, "me", "app", repo)
+	if row.Status != string(StatusSkipped) || !strings.Contains(row.Detail, "organization") {
+		t.Fatalf("personal required-workflows result = %+v, want skipped with availability detail", row)
+	}
+}
+
+func TestGitHubOrgPoliciesDoNotTreatMissingFieldsAsCompliant(t *testing.T) {
+	base := auditGitHubOrgBasePermission("acme", &github.Organization{
+		DefaultRepoPermission: github.Ptr("read"),
+	}, nil)
+	if base.Status != string(StatusSkipped) {
+		t.Fatalf("missing public-repo creation field: got %s, want skipped", base.Status)
+	}
+
+	client := mockClient(map[string]string{
+		"GET /orgs/acme/actions/permissions": `{}`,
+	})
+	actions := auditGitHubOrgActionsPolicy(context.Background(), client, "acme")
+	if actions.Status != string(StatusSkipped) {
+		t.Fatalf("missing org Actions fields: got %s, want skipped", actions.Status)
 	}
 }
 
@@ -179,8 +215,14 @@ func TestGitHubRepoFieldAudits(t *testing.T) {
 	if r := auditGitHubForkPolicy(&github.Repository{FullName: github.Ptr("me/app"), Private: github.Ptr(true), AllowForking: github.Ptr(true)}); r.Status != string(StatusGap) {
 		t.Errorf("fork-policy private+fork: got %s, want gap", r.Status)
 	}
+	if r := auditGitHubForkPolicy(&github.Repository{FullName: github.Ptr("me/app"), Private: github.Ptr(true)}); r.Status != string(StatusSkipped) {
+		t.Errorf("fork-policy nil setting: got %s, want skipped", r.Status)
+	}
 	if r := auditGitHubWikiSurface(&github.Repository{FullName: github.Ptr("me/app"), Private: github.Ptr(false), HasWiki: github.Ptr(true)}); r.Status != string(StatusGap) {
 		t.Errorf("wiki public+wiki: got %s, want gap", r.Status)
+	}
+	if r := auditGitHubWikiSurface(&github.Repository{FullName: github.Ptr("me/app"), Private: github.Ptr(false)}); r.Status != string(StatusSkipped) {
+		t.Errorf("wiki nil setting: got %s, want skipped", r.Status)
 	}
 }
 
@@ -201,10 +243,13 @@ func TestWorkflowPermissionIssue(t *testing.T) {
 		{"top-level read map", "permissions:\n  contents: read\njobs:\n  x:\n    steps: []", ""},
 		{"read-all string", "permissions: read-all\njobs:\n  x: {}", ""},
 		{"write-all", "permissions: write-all\njobs:\n  x: {}", "write-all token"},
-		{"top-level write map", "permissions:\n  contents: write\njobs:\n  x: {}", "write permission: contents"},
+		{"top-level scoped write", "permissions:\n  contents: write\njobs:\n  x: {}", ""},
+		{"job overrides top-level with write-all", "permissions:\n  contents: read\njobs:\n  x:\n    permissions: write-all", "write-all token"},
 		{"no permissions", "jobs:\n  x:\n    steps: []", "no explicit permissions"},
 		{"per-job read", "jobs:\n  x:\n    permissions:\n      contents: read", ""},
-		{"per-job write", "jobs:\n  x:\n    permissions:\n      contents: write", "write permission: contents"},
+		{"per-job scoped write", "jobs:\n  x:\n    permissions:\n      contents: write", ""},
+		{"invalid permission string", "permissions: everything\njobs:\n  x: {}", "invalid permissions value"},
+		{"invalid permission value", "permissions:\n  contents: yes\njobs:\n  x: {}", "invalid permission value: contents"},
 		{"one job missing", "jobs:\n  x:\n    permissions:\n      contents: read\n  y:\n    steps: []", "no explicit permissions"},
 		{"unparseable", "permissions: [oops\n  bad", "unparseable"},
 	}
@@ -212,6 +257,64 @@ func TestWorkflowPermissionIssue(t *testing.T) {
 		if got := workflowPermissionIssue(c.content); got != c.want {
 			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
 		}
+	}
+}
+
+func TestWorkflowUsesActionIgnoresComments(t *testing.T) {
+	commentOnly := "name: CI\n# uses: github/codeql-action/analyze@v4\njobs:\n  test:\n    steps: []\n"
+	uses, err := workflowUsesAction(commentOnly, "github/codeql-action/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uses {
+		t.Fatal("comment must not count as an action reference")
+	}
+	real := "jobs:\n  scan:\n    steps:\n      - uses: github/codeql-action/analyze@v4\n"
+	uses, err = workflowUsesAction(real, "github/codeql-action/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !uses {
+		t.Fatal("real uses entry was not detected")
+	}
+}
+
+func TestListWorkflowFilesFailsWhenAnyFileCannotBeRead(t *testing.T) {
+	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/repos/me/app/contents/.github/workflows":
+			return jsonResponse(`[{"type":"file","name":"ci.yml","path":".github/workflows/ci.yml"}]`), nil
+		case "/repos/me/app/contents/.github/workflows/ci.yml":
+			return &http.Response{StatusCode: http.StatusInternalServerError, Header: make(http.Header), Body: http.NoBody}, nil
+		default:
+			return jsonResponse(`{}`), nil
+		}
+	})})
+	if _, err := listWorkflowFiles(context.Background(), client, "me", "app", "main"); err == nil ||
+		!strings.Contains(err.Error(), "could not read all workflow files") {
+		t.Fatalf("workflow read failure should propagate, got %v", err)
+	}
+}
+
+func TestRepoSecretIdentifiersAreHiddenByDefault(t *testing.T) {
+	client := mockClient(map[string]string{
+		"GET /repos/me/app/actions/secrets": `{
+			"total_count":1,
+			"secrets":[{
+				"name":"CUSTOMER_PRODUCTION_TOKEN",
+				"created_at":"2020-01-01T00:00:00Z",
+				"updated_at":"2020-01-01T00:00:00Z"
+			}]
+		}`,
+	})
+	repo := &github.Repository{FullName: github.Ptr("me/app")}
+	hidden := auditGitHubRepoSecrets(context.Background(), client, "me", "app", repo, 30, false)
+	if strings.Contains(hidden.Detail, "CUSTOMER_PRODUCTION_TOKEN") {
+		t.Fatalf("secret identifier leaked by default: %q", hidden.Detail)
+	}
+	shown := auditGitHubRepoSecrets(context.Background(), client, "me", "app", repo, 30, true)
+	if !strings.Contains(shown.Detail, "CUSTOMER_PRODUCTION_TOKEN") {
+		t.Fatalf("--show-identifiers detail missing identifier: %q", shown.Detail)
 	}
 }
 

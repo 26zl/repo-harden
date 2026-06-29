@@ -1,0 +1,6 @@
+* @26zl
+
+/.github/workflows/ @26zl
+/.goreleaser.yaml @26zl
+/internal/repoharden/state.go @26zl
+/internal/repoharden/harden.go @26zl

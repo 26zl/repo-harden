@@ -12,12 +12,19 @@ remediation progress. Coordinated disclosure is appreciated.
 
 ## Supported versions
 
-This project is pre-1.0; only the latest release on `main` receives security
-fixes.
+This project is pre-1.0 and has no stable release line yet. Security fixes are
+made on `main`; after tagged prereleases begin, only the newest prerelease will
+be supported.
 
 ## Scope
 
 `repo-harden` is a local CLI that uses a token you provide. It performs no
-network calls other than to the configured forge API. It never writes or
-transmits your token, and hardening changes are recorded locally so `revert`
-can undo exactly what it applied.
+runtime network calls other than to the configured forge API. The token is
+never written to disk; it is sent only as an authentication header to that
+API over HTTPS (loopback HTTP is allowed for local Gitea/Forgejo testing).
+Cross-host redirects and HTTPS-to-HTTP downgrades are rejected.
+
+Hardening state is stored locally with mode `0600`, is bound to the forge host
+and authenticated account, and contains settings metadata but no token or
+secret values. Audit output hides secret and CI-variable names unless
+`--show-identifiers` is explicitly requested.

@@ -47,6 +47,15 @@ func TestDetectSkipsOnNoAdminAccess(t *testing.T) {
 	}
 }
 
+func TestEndpointUnavailableDoesNotHideRateLimits(t *testing.T) {
+	resp := &http.Response{StatusCode: http.StatusForbidden, Header: make(http.Header)}
+	resp.Header.Set("X-RateLimit-Remaining", "0")
+	err := &github.ErrorResponse{Response: resp}
+	if endpointUnavailable(err) {
+		t.Fatal("rate-limited 403 must be reported as an error, not skipped as unavailable")
+	}
+}
+
 func TestSecurityMdDetectErrorsOnNon404(t *testing.T) {
 	ctl := controlByKey(t, "security-md")
 	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -139,6 +148,12 @@ func TestActionsAllowlistDetect(t *testing.T) {
 
 func TestActionsAllowlistDisabledAndPatterns(t *testing.T) {
 	ctl := controlByKey(t, "actions-allowlist")
+	missing := mockClient(map[string]string{
+		"GET /repos/me/app/actions/permissions": `{}`,
+	})
+	if got := ctl.Detect(context.Background(), missing, "me", "app", nil); got.Status != StatusSkipped {
+		t.Fatalf("missing enabled field: got %s, want skipped", got.Status)
+	}
 	disabled := mockClient(map[string]string{
 		"GET /repos/me/app/actions/permissions": `{"enabled":false}`,
 	})
@@ -166,6 +181,17 @@ func TestPrivateVulnerabilityReportingDetect(t *testing.T) {
 	}
 }
 
+func TestControlsOutputKeepsLongKeysSeparated(t *testing.T) {
+	out := captureStdout(t, func() {
+		if err := cmdControls(&opts{color: "never"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "private-vulnerability-reporting  medium") {
+		t.Fatalf("long control key is not separated from severity:\n%s", out)
+	}
+}
+
 func TestCodeScanningCompliantViaAdvancedSetup(t *testing.T) {
 	ctl := controlByKey(t, "code-scanning")
 	// recent analysis -> compliant (future date keeps this deterministic)
@@ -183,6 +209,29 @@ func TestCodeScanningCompliantViaAdvancedSetup(t *testing.T) {
 	})
 	if got := ctl.Detect(context.Background(), stale, "me", "app", &github.Repository{}); got.Status != StatusGap {
 		t.Fatalf("stale analysis: got %s, want gap", got.Status)
+	}
+}
+
+func TestCodeScanningAnalysisErrorDoesNotBecomeGap(t *testing.T) {
+	ctl := controlByKey(t, "code-scanning")
+	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/repos/me/app/code-scanning/default-setup":
+			return jsonResponse(`{"state":"not-configured"}`), nil
+		case "/repos/me/app/code-scanning/analyses":
+			return &http.Response{
+				StatusCode: http.StatusInternalServerError,
+				Header:     make(http.Header),
+				Body:       http.NoBody,
+				Request:    req,
+			}, nil
+		default:
+			return &http.Response{StatusCode: http.StatusNotFound, Header: make(http.Header), Body: http.NoBody, Request: req}, nil
+		}
+	})})
+	got := ctl.Detect(context.Background(), client, "me", "app", &github.Repository{DefaultBranch: github.Ptr("main")})
+	if got.Status != StatusError {
+		t.Fatalf("analysis API failure: got %s (%s), want error", got.Status, got.Detail)
 	}
 }
 
@@ -225,6 +274,9 @@ func TestBranchProtectionDetect(t *testing.T) {
 func TestBranchProtectionApplyCreatesRuleset(t *testing.T) {
 	var created bool
 	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodGet && req.URL.Path == "/repos/me/app/rulesets" {
+			return jsonResponse(`[]`), nil
+		}
 		if req.Method == http.MethodPost && req.URL.Path == "/repos/me/app/rulesets" {
 			created = true
 			return jsonResponse(`{"id":7,"name":"repo-harden"}`), nil

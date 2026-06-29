@@ -56,6 +56,33 @@ func TestRenderAuditJSONRoundTrips(t *testing.T) {
 	}
 }
 
+func TestCmdAuditRunsSelectedControlEndToEnd(t *testing.T) {
+	client := mockClient(map[string]string{
+		"GET /user/repos": `[{"full_name":"me/app","owner":{"login":"me"},"private":false,"fork":false,"archived":false}]`,
+	})
+	o := &opts{
+		provider:    "github",
+		host:        "github.com",
+		format:      "json",
+		only:        "public-exposure",
+		orgAudit:    false,
+		concurrency: 1,
+		staleDays:   180,
+	}
+	out := captureStdout(t, func() {
+		if err := cmdAudit(context.Background(), client, o); err != nil {
+			t.Fatal(err)
+		}
+	})
+	var rows []auditRow
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
+		t.Fatalf("audit JSON invalid: %v\n%s", err, out)
+	}
+	if len(rows) != 1 || rows[0].Control != "public-exposure" || rows[0].Status != string(StatusGap) {
+		t.Fatalf("audit rows = %+v", rows)
+	}
+}
+
 func TestRenderAuditMarkdownSmoke(t *testing.T) {
 	rows := []auditRow{{Control: "secret-scanning", Title: "Secret scanning", Severity: "critical", Status: string(StatusGap), Repo: "me/app", Detail: "off"}}
 	out := captureStdout(t, func() { renderAuditMarkdown(rows, 1) })
@@ -164,9 +191,22 @@ func TestAuditScoreWeightsFindings(t *testing.T) {
 	rows := []auditRow{
 		{Severity: "high", Status: string(StatusCompliant)},
 		{Severity: "high", Status: string(StatusGap)},
+		{Severity: "critical", Status: string(StatusSkipped)},
 	}
 	if got := auditScore(rows); got != 50 {
-		t.Fatalf("score = %d, want 50", got)
+		t.Fatalf("score = %d, want 50 (skipped controls must not affect score)", got)
+	}
+	if auditScoreAvailable([]auditRow{{Status: string(StatusSkipped)}}) {
+		t.Fatal("all-skipped audit must report score as unavailable")
+	}
+	if got := auditVerification(rows); got != 50 {
+		t.Fatalf("verification = %d, want 50 (the skipped critical row is unverified)", got)
+	}
+	if !auditHasSkipped(rows) {
+		t.Fatal("skipped row was not detected")
+	}
+	if auditHasSkipped([]auditRow{{Status: string(StatusCompliant)}}) {
+		t.Fatal("compliant-only rows must not report skipped checks")
 	}
 }
 
@@ -176,5 +216,15 @@ func TestValidateAuditSelectionRejectsUnknown(t *testing.T) {
 	}
 	if err := validateAuditSelection("not-a-control", ""); err == nil {
 		t.Fatal("expected unknown audit control to fail")
+	}
+}
+
+func TestValidateAuditSelectionRejectsUnsupportedProviderControl(t *testing.T) {
+	err := validateAuditSelectionForProvider("gitlab", "code-scanning", "")
+	if err == nil || !strings.Contains(err.Error(), "unsupported by provider gitlab") {
+		t.Fatalf("unsupported provider control should fail, got %v", err)
+	}
+	if err := validateAuditSelectionForProvider("gitlab", "branch-protection-full", ""); err != nil {
+		t.Fatalf("supported GitLab control rejected: %v", err)
 	}
 }

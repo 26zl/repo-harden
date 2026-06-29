@@ -2,6 +2,7 @@ package repoharden
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -14,11 +15,12 @@ import (
 type hardenRecorder struct {
 	mu      sync.Mutex
 	path    string
+	scope   StateScope
 	entries []HardenEntry
 }
 
-func newHardenRecorder(path string, entries []HardenEntry) *hardenRecorder {
-	return &hardenRecorder{path: path, entries: entries}
+func newHardenRecorder(path string, scope StateScope, entries []HardenEntry) *hardenRecorder {
+	return &hardenRecorder{path: path, scope: scope, entries: entries}
 }
 
 func (r *hardenRecorder) count() int {
@@ -27,49 +29,69 @@ func (r *hardenRecorder) count() int {
 	return len(r.entries)
 }
 
-func (r *hardenRecorder) record(e HardenEntry) (bool, error) {
+// record stores a pending change before the API mutation starts.
+func (r *hardenRecorder) record(e HardenEntry) (wasNew bool, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	e.Phase = HardenPhasePending
 	key := e.Repo + "\x00" + e.Control
 	for i, existing := range r.entries {
 		if existing.Repo+"\x00"+existing.Control == key {
-			// update prior so revert uses the latest pre-change value
-			if existing.Prior == e.Prior {
-				return true, nil
+			if existing.Prior == e.Prior && existing.Phase == HardenPhasePending {
+				return false, nil
 			}
-			prev := r.entries[i].Prior
-			r.entries[i].Prior = e.Prior
-			if err := saveHardenState(r.path, r.entries); err != nil {
-				r.entries[i].Prior = prev
+			prev := r.entries[i]
+			r.entries[i] = e
+			if err := saveHardenState(r.path, r.scope, r.entries); err != nil {
+				r.entries[i] = prev
 				return false, err
 			}
-			return true, nil
+			return false, nil
 		}
 	}
 	r.entries = append(r.entries, e)
-	if err := saveHardenState(r.path, r.entries); err != nil {
+	if err := saveHardenState(r.path, r.scope, r.entries); err != nil {
 		r.entries = r.entries[:len(r.entries)-1]
 		return false, err
 	}
 	return true, nil
 }
 
-// remove drops a recorded entry, e.g. after Apply fails.
-func (r *hardenRecorder) remove(e HardenEntry) {
+func (r *hardenRecorder) setPhase(e HardenEntry, phase HardenPhase) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	key := e.Repo + "\x00" + e.Control
 	for i, existing := range r.entries {
 		if existing.Repo+"\x00"+existing.Control == key {
-			r.entries = append(r.entries[:i], r.entries[i+1:]...)
-			if err := saveHardenState(r.path, r.entries); err != nil {
-				// if this didn't save, state still has an entry for a change that
-				// never applied; warn so a later revert doesn't act on it.
-				fmt.Fprintf(os.Stderr, "warn: could not update state after rolling back %s on %s: %v\n", e.Control, e.Repo, err)
+			previous := r.entries[i].Phase
+			r.entries[i].Phase = phase
+			if err := saveHardenState(r.path, r.scope, r.entries); err != nil {
+				r.entries[i].Phase = previous
+				return err
 			}
-			return
+			return nil
 		}
 	}
+	return fmt.Errorf("state entry disappeared for %s on %s", e.Control, e.Repo)
+}
+
+func (r *hardenRecorder) remove(e HardenEntry) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := e.Repo + "\x00" + e.Control
+	for i, existing := range r.entries {
+		if existing.Repo+"\x00"+existing.Control != key {
+			continue
+		}
+		previous := append([]HardenEntry(nil), r.entries...)
+		r.entries = append(r.entries[:i], r.entries[i+1:]...)
+		if err := saveHardenState(r.path, r.scope, r.entries); err != nil {
+			r.entries = previous
+			return err
+		}
+		return nil
+	}
+	return nil
 }
 
 func collectHarden(ctx context.Context, c *github.Client, o *opts, repos []*github.Repository, recorder *hardenRecorder) (applied, skipped, failed int, err error) {
@@ -81,7 +103,6 @@ func collectHarden(ctx context.Context, c *github.Client, o *opts, repos []*gith
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(o.concurrency)
 	for _, r := range repos {
-		r := r
 		g.Go(func() error {
 			owner, name := splitRepo(r.GetFullName())
 			for _, ctl := range controls {
@@ -95,13 +116,13 @@ func collectHarden(ctx context.Context, c *github.Client, o *opts, repos []*gith
 				case StatusSkipped:
 					mu.Lock()
 					skipped++
-					fmt.Printf("%-6s %s :: %s (%s)\n", actionLabel(o, "skip"), r.GetFullName(), ctl.Key, res.Detail)
+					fmt.Printf("%-6s %s :: %s (%s)\n", actionLabel(o, "skip"), r.GetFullName(), ctl.Key, sanitizeDetail(res.Detail))
 					mu.Unlock()
 					continue
 				case StatusError:
 					mu.Lock()
 					failed++
-					fmt.Fprintf(os.Stderr, "  %s %s :: %s: %s\n", actionLabel(o, "ERROR"), r.GetFullName(), ctl.Key, res.Detail)
+					fmt.Fprintf(os.Stderr, "  %s %s :: %s: %s\n", actionLabel(o, "ERROR"), r.GetFullName(), ctl.Key, sanitizeDetail(res.Detail))
 					mu.Unlock()
 					continue
 				}
@@ -112,26 +133,57 @@ func collectHarden(ctx context.Context, c *github.Client, o *opts, repos []*gith
 				}
 				mu.Lock()
 				fmt.Printf("%s %s :: %s%s\n", actionLabel(o, "harden"), r.GetFullName(), ctl.Key, hint)
-				mu.Unlock()
 				if o.dryRun {
+					applied++ // count gaps that would be hardened
+					mu.Unlock()
 					continue
 				}
+				mu.Unlock()
 				if recorder == nil {
 					return fmt.Errorf("harden recorder is required when not in dry-run mode")
 				}
 				entry := HardenEntry{Repo: r.GetFullName(), Control: ctl.Key, Prior: res.Prior}
-				if _, err := recorder.record(entry); err != nil {
+				_, rerr := recorder.record(entry)
+				if rerr != nil {
 					mu.Lock()
 					failed++
-					fmt.Fprintf(os.Stderr, "  %s %s :: %s: save state before apply: %v\n", actionLabel(o, "FAILED"), r.GetFullName(), ctl.Key, err)
+					fmt.Fprintf(os.Stderr, "  %s %s :: %s: save state before apply: %v\n", actionLabel(o, "FAILED"), r.GetFullName(), ctl.Key, rerr)
 					mu.Unlock()
 					continue
 				}
 				if err := ctl.Apply(gctx, c, owner, name); err != nil {
-					recorder.remove(entry) // apply failed, drop the entry
+					after := ctl.Detect(gctx, c, owner, name, r)
+					switch {
+					case after.Status == StatusCompliant:
+						if serr := recorder.setPhase(entry, HardenPhaseApplied); serr != nil {
+							err = errors.Join(err, fmt.Errorf("mark applied state: %w", serr))
+						}
+					case after.Status == StatusGap && after.Prior == entry.Prior:
+						if serr := recorder.remove(entry); serr != nil {
+							err = errors.Join(err, fmt.Errorf("remove unchanged pending state: %w", serr))
+						}
+					case after.Status == StatusGap:
+						if rerr := ctl.Revert(gctx, c, owner, name, entry.Prior); rerr == nil {
+							if serr := recorder.remove(entry); serr != nil {
+								err = errors.Join(err, fmt.Errorf("remove compensated state: %w", serr))
+							}
+						} else {
+							_ = recorder.setPhase(entry, HardenPhaseUnknown)
+							err = errors.Join(err, fmt.Errorf("compensating rollback failed: %w", rerr))
+						}
+					default:
+						_ = recorder.setPhase(entry, HardenPhaseUnknown)
+					}
 					mu.Lock()
 					failed++
 					fmt.Fprintf(os.Stderr, "  %s %s :: %s: %v\n", actionLabel(o, "FAILED"), r.GetFullName(), ctl.Key, err)
+					mu.Unlock()
+					continue
+				}
+				if err := recorder.setPhase(entry, HardenPhaseApplied); err != nil {
+					mu.Lock()
+					failed++
+					fmt.Fprintf(os.Stderr, "  %s %s :: %s: mutation succeeded but state update failed: %v\n", actionLabel(o, "FAILED"), r.GetFullName(), ctl.Key, err)
 					mu.Unlock()
 					continue
 				}
@@ -154,27 +206,39 @@ func cmdHarden(ctx context.Context, c *github.Client, o *opts) error {
 		return err
 	}
 	if o.dryRun {
-		_, skipped, _, err := collectHarden(ctx, c, o, repos, nil)
+		would, skipped, failed, err := collectHarden(ctx, c, o, repos, nil)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("\ndry-run: would harden gaps (%d skipped for license)\n", skipped)
+		fmt.Printf("\ndry-run: would harden %d gaps (%d skipped, %d detection errors)\n", would, skipped, failed)
+		if failed > 0 {
+			return exitError(1)
+		}
 		return nil
 	}
 	path, err := hardenStateFilePath(o)
 	if err != nil {
 		return err
 	}
-	existing, err := loadHardenState(path)
+	scope, err := githubStateScope(ctx, c, o)
 	if err != nil {
 		return err
 	}
-	recorder := newHardenRecorder(path, existing)
+	unlock, err := lockStateFile(ctx, path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unlock() }()
+	existing, err := loadHardenState(path, scope)
+	if err != nil {
+		return err
+	}
+	recorder := newHardenRecorder(path, scope, existing)
 	applied, skipped, failed, err := collectHarden(ctx, c, o, repos, recorder)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("\nhardened %d settings (%d skipped license, %d failed); state has %d entries: %s\n",
+	fmt.Printf("\nhardened %d settings (%d skipped, %d failed); state has %d entries: %s\n",
 		applied, skipped, failed, recorder.count(), path)
 	if failed > 0 {
 		return exitError(1)
@@ -182,18 +246,27 @@ func cmdHarden(ctx context.Context, c *github.Client, o *opts) error {
 	return nil
 }
 
-// scopeEntries splits entries into revert/keep by --only/--skip.
-func scopeEntries(entries []HardenEntry, only, skip string) (toRevert, kept []HardenEntry) {
-	onlySet := splitSet(only)
-	skipSet := splitSet(skip)
+// scopeEntries splits entries into revert/keep by control and repository filters.
+func scopeEntries(entries []HardenEntry, o *opts) (toRevert, kept []HardenEntry, err error) {
+	onlySet := splitSet(o.only)
+	skipSet := splitSet(o.skip)
+	repos, err := requestedRepoSet(o.repo)
+	if err != nil {
+		return nil, nil, err
+	}
 	for _, e := range entries {
-		if (len(onlySet) > 0 && !onlySet[e.Control]) || skipSet[e.Control] {
+		owner, _ := splitRepo(e.Repo)
+		outOfRepoScope := o.owner != "" && !strings.EqualFold(owner, o.owner)
+		if len(repos) > 0 && !repos[strings.ToLower(e.Repo)] {
+			outOfRepoScope = true
+		}
+		if outOfRepoScope || (len(onlySet) > 0 && !onlySet[e.Control]) || skipSet[e.Control] {
 			kept = append(kept, e)
 			continue
 		}
 		toRevert = append(toRevert, e)
 	}
-	return toRevert, kept
+	return toRevert, kept, nil
 }
 
 func controlMap() map[string]Control {
@@ -204,6 +277,13 @@ func controlMap() map[string]Control {
 	return m
 }
 
+func matchesHardenedState(ctl Control, result DetectResult) bool {
+	if ctl.MatchesHardened != nil {
+		return ctl.MatchesHardened(result)
+	}
+	return result.Status == StatusCompliant
+}
+
 // revertEntries reverts each entry; returns the ones that failed so we can re-save them.
 func revertEntries(ctx context.Context, c *github.Client, o *opts, entries []HardenEntry) []HardenEntry {
 	cm := controlMap()
@@ -212,16 +292,12 @@ func revertEntries(ctx context.Context, c *github.Client, o *opts, entries []Har
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(o.concurrency)
 	for _, e := range entries {
-		e := e
 		g.Go(func() error {
 			ctl, ok := cm[e.Control]
 			owner, name := splitRepo(e.Repo)
 			mu.Lock()
 			fmt.Printf("%s %s :: %s\n", actionLabel(o, "revert"), e.Repo, e.Control)
 			mu.Unlock()
-			if o.dryRun {
-				return nil
-			}
 			if !ok || ctl.Revert == nil {
 				mu.Lock()
 				remaining = append(remaining, e)
@@ -229,7 +305,30 @@ func revertEntries(ctx context.Context, c *github.Client, o *opts, entries []Har
 				mu.Unlock()
 				return nil
 			}
-			err := ctl.Revert(gctx, c, owner, name, e.Prior)
+			repo, _, err := c.Repositories.Get(gctx, owner, name)
+			if err != nil {
+				mu.Lock()
+				remaining = append(remaining, e)
+				fmt.Fprintf(os.Stderr, "  %s %s :: %s: verify live state before revert: %v\n", actionLabel(o, "FAILED"), e.Repo, e.Control, err)
+				mu.Unlock()
+				return nil
+			}
+			current := ctl.Detect(gctx, c, owner, name, repo)
+			if current.Status == StatusGap && current.Prior == e.Prior {
+				return nil // already restored or the recorded mutation never took effect
+			}
+			if !matchesHardenedState(ctl, current) {
+				mu.Lock()
+				remaining = append(remaining, e)
+				fmt.Fprintf(os.Stderr, "  %s %s :: %s: live setting drifted; refusing to overwrite it (%s: %s)\n",
+					actionLabel(o, "FAILED"), e.Repo, e.Control, current.Status, sanitizeDetail(current.Detail))
+				mu.Unlock()
+				return nil
+			}
+			if o.dryRun {
+				return nil
+			}
+			err = ctl.Revert(gctx, c, owner, name, e.Prior)
 			mu.Lock()
 			if err != nil {
 				remaining = append(remaining, e)
@@ -246,27 +345,46 @@ func revertEntries(ctx context.Context, c *github.Client, o *opts, entries []Har
 
 func cmdRevert(ctx context.Context, c *github.Client, o *opts) error {
 	if err := validateControlSelection(o.only, o.skip); err != nil {
-		return err
+		return usageError{err}
 	}
 	path, err := hardenStateFilePath(o)
 	if err != nil {
 		return err
 	}
-	entries, err := loadHardenState(path)
+	scope, err := githubStateScope(ctx, c, o)
+	if err != nil {
+		return err
+	}
+	unlock, err := lockStateFile(ctx, path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unlock() }()
+	entries, err := loadHardenState(path, scope)
 	if err != nil {
 		return err
 	}
 	if len(entries) == 0 {
 		return fmt.Errorf("harden-state empty or missing: %s — run harden first", path)
 	}
-	toRevert, kept := scopeEntries(entries, o.only, o.skip)
+	toRevert, kept, err := scopeEntries(entries, o)
+	if err != nil {
+		return usageError{err}
+	}
+	if len(toRevert) == 0 {
+		return usageErr("no harden-state entries match the requested repository/control scope")
+	}
 	remaining := revertEntries(ctx, c, o, toRevert)
 	if o.dryRun {
-		fmt.Printf("\ndry-run: would revert %d changes (%d kept out of scope)\n", len(toRevert), len(kept))
+		fmt.Printf("\ndry-run: would revert %d changes (%d blocked by drift/errors, %d kept out of scope)\n",
+			len(toRevert)-len(remaining), len(remaining), len(kept))
+		if len(remaining) > 0 {
+			return exitError(1)
+		}
 		return nil
 	}
 	finalState := append(kept, remaining...)
-	if err := saveHardenState(path, finalState); err != nil {
+	if err := saveHardenState(path, scope, finalState); err != nil {
 		return err
 	}
 	fmt.Printf("\nreverted %d changes (%d failed, %d kept out of scope; remaining state: %d)\n",

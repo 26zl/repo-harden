@@ -34,7 +34,6 @@ func collectAudit(ctx context.Context, c *github.Client, o *opts, repos []*githu
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(o.concurrency)
 	for _, r := range repos {
-		r := r
 		g.Go(func() error {
 			owner, name := splitRepo(r.GetFullName())
 			for _, ctl := range controls {
@@ -129,17 +128,18 @@ func auditScore(rows []auditRow) int {
 	total := 0
 	lost := 0
 	for _, row := range rows {
+		if ControlStatus(row.Status) == StatusSkipped {
+			continue
+		}
 		weight := auditWeight(row)
 		total += weight
 		switch ControlStatus(row.Status) {
 		case StatusGap, StatusError:
 			lost += weight
-		case StatusSkipped:
-			lost += weight / 2
 		}
 	}
 	if total == 0 {
-		return 100
+		return 0
 	}
 	score := 100 - (lost * 100 / total)
 	if score < 0 {
@@ -149,18 +149,24 @@ func auditScore(rows []auditRow) int {
 }
 
 func cmdAudit(ctx context.Context, c *github.Client, o *opts) error {
-	if err := validateAuditSelection(o.only, o.skip); err != nil {
-		return err
+	if err := validateAuditSelectionForProvider(o.provider, o.only, o.skip); err != nil {
+		return usageError{err}
 	}
 	rows, repoCount, err := runAudit(ctx, c, o)
 	if err != nil {
 		return err
+	}
+	if len(rows) == 0 {
+		return fmt.Errorf("audit produced no results; no selected controls could be evaluated")
 	}
 	sort.Slice(rows, func(i, j int) bool { return auditLess(rows[i], rows[j]) })
 	if err := renderAudit(rows, repoCount, o); err != nil {
 		return err
 	}
 	if o.exitCode && auditHasFindings(rows) {
+		return exitError(1)
+	}
+	if o.failOnSkipped && auditHasSkipped(rows) {
 		return exitError(1)
 	}
 	return nil
@@ -238,6 +244,99 @@ func validateAuditSelection(only, skip string) error {
 	return nil
 }
 
+func providerAuditControlKeys(provider string) map[string]bool {
+	if provider == "github" {
+		return auditControlKeys()
+	}
+	keys := map[string]bool{}
+	for _, key := range []string{
+		"token-scopes",
+		"public-exposure",
+		"stale-repo",
+		"default-branch",
+		"branch-protection-full",
+		"signed-commits",
+		"required-workflows",
+		"environment-protection",
+		"repo-secrets",
+		"deploy-keys",
+		"webhooks",
+		"collaborators",
+		"vulnerability-alert-count",
+		"releases",
+		"packages",
+		"dependency-sbom",
+		"archived-active-risk",
+	} {
+		keys[key] = true
+	}
+	return keys
+}
+
+func validateAuditSelectionForProvider(provider, only, skip string) error {
+	if err := validateAuditSelection(only, skip); err != nil {
+		return err
+	}
+	supported := providerAuditControlKeys(provider)
+	for flag, values := range map[string]map[string]bool{"--only": splitSet(only), "--skip": splitSet(skip)} {
+		var unavailable []string
+		for key := range values {
+			if !supported[key] {
+				unavailable = append(unavailable, key)
+			}
+		}
+		if len(unavailable) > 0 {
+			sort.Strings(unavailable)
+			return fmt.Errorf("%s contains control(s) unsupported by provider %s: %s",
+				flag, provider, strings.Join(unavailable, ", "))
+		}
+	}
+	selected := 0
+	onlySet := splitSet(only)
+	skipSet := splitSet(skip)
+	for key := range supported {
+		if len(onlySet) > 0 && !onlySet[key] {
+			continue
+		}
+		if !skipSet[key] {
+			selected++
+		}
+	}
+	if selected == 0 {
+		return fmt.Errorf("no audit controls selected for provider %s", provider)
+	}
+	return nil
+}
+
+func auditScoreAvailable(rows []auditRow) bool {
+	for _, row := range rows {
+		if ControlStatus(row.Status) != StatusSkipped {
+			return true
+		}
+	}
+	return false
+}
+
+// auditVerification reports the severity-weighted share of controls that
+// produced a definite compliant or gap result. Skipped and error rows remain
+// visible as unknown rather than silently inflating confidence in the score.
+func auditVerification(rows []auditRow) int {
+	total := 0
+	verified := 0
+	for _, row := range rows {
+		weight := auditWeight(row)
+		total += weight
+		switch ControlStatus(row.Status) {
+		case StatusCompliant, StatusGap:
+			verified += weight
+		}
+	}
+	if total == 0 {
+		return 0
+	}
+	return verified * 100 / total
+}
+
 func runAudit(ctx context.Context, c *github.Client, o *opts) ([]auditRow, int, error) {
 	switch o.provider {
 	case "github":
@@ -307,6 +406,15 @@ func auditHasFindings(rows []auditRow) bool {
 	return false
 }
 
+func auditHasSkipped(rows []auditRow) bool {
+	for _, row := range rows {
+		if ControlStatus(row.Status) == StatusSkipped {
+			return true
+		}
+	}
+	return false
+}
+
 func renderAudit(rows []auditRow, repoCount int, o *opts) error {
 	switch o.format {
 	case "json":
@@ -353,7 +461,7 @@ func renderAuditTable(rows []auditRow, repoCount int, o *opts) {
 		}
 		fmt.Printf("\n%s  %s\n",
 			colorize(o, colorCyan, target),
-			colorize(o, colorGray, fmt.Sprintf("(%d/100)", auditScore(grp)))) // score uses the whole group
+			colorize(o, colorGray, auditScoreText(grp))) // score uses the whole group
 		printAuditRows(display, o)
 	}
 	if hidden > 0 {
@@ -381,7 +489,7 @@ func printAuditRows(rows []auditRow, o *opts) {
 	var grid [][]cell
 	for _, r := range rows {
 		sym, _ := statusGlyph(r.Status)
-		detail := truncate(r.Detail, detailColWidth)
+		detail := truncate(sanitizeDetail(r.Detail), detailColWidth)
 		grid = append(grid, []cell{
 			{"  " + sym, "  " + glyph(o, r.Status)},
 			{r.Severity, severityLabel(o, r.Severity)},
@@ -421,6 +529,17 @@ func renderAuditSummary(rows []auditRow, repoCount int, o *opts) {
 	for _, r := range rows {
 		counts[r.Status]++
 	}
+	if !auditScoreAvailable(rows) {
+		fmt.Printf("Posture %s  verification %d%%\n",
+			colorize(o, colorGray, "n/a (no controls evaluated)"), auditVerification(rows))
+		fmt.Printf("  %s %d compliant   %s %d gap   %s %d skipped   %s %d error   %s\n",
+			glyph(o, string(StatusCompliant)), counts[string(StatusCompliant)],
+			glyph(o, string(StatusGap)), counts[string(StatusGap)],
+			glyph(o, string(StatusSkipped)), counts[string(StatusSkipped)],
+			glyph(o, string(StatusError)), counts[string(StatusError)],
+			colorize(o, colorGray, fmt.Sprintf("(%d repos)", repoCount)))
+		return
+	}
 	score := auditScore(rows)
 	sc := colorGreen
 	if score < scoreLow {
@@ -428,13 +547,21 @@ func renderAuditSummary(rows []auditRow, repoCount int, o *opts) {
 	} else if score < scoreOK {
 		sc = colorYellow
 	}
-	fmt.Printf("Posture %s  %s\n", colorize(o, sc, fmt.Sprintf("%d/100", score)), scoreBar(o, score))
+	fmt.Printf("Posture %s  %s  verification %d%%\n",
+		colorize(o, sc, fmt.Sprintf("%d/100", score)), scoreBar(o, score), auditVerification(rows))
 	fmt.Printf("  %s %d compliant   %s %d gap   %s %d skipped   %s %d error   %s\n",
 		glyph(o, string(StatusCompliant)), counts[string(StatusCompliant)],
 		glyph(o, string(StatusGap)), counts[string(StatusGap)],
 		glyph(o, string(StatusSkipped)), counts[string(StatusSkipped)],
 		glyph(o, string(StatusError)), counts[string(StatusError)],
 		colorize(o, colorGray, fmt.Sprintf("(%d repos)", repoCount)))
+}
+
+func auditScoreText(rows []auditRow) string {
+	if !auditScoreAvailable(rows) {
+		return fmt.Sprintf("(n/a; verified %d%%)", auditVerification(rows))
+	}
+	return fmt.Sprintf("(%d/100; verified %d%%)", auditScore(rows), auditVerification(rows))
 }
 
 func renderTopRecommendations(rows []auditRow, o *opts) {
@@ -467,7 +594,12 @@ func renderTopRecommendations(rows []auditRow, o *opts) {
 
 func renderAuditMarkdown(rows []auditRow, repoCount int) {
 	fmt.Printf("# repo-harden audit\n\n")
-	fmt.Printf("Score: **%d/100**  \n", auditScore(rows))
+	if auditScoreAvailable(rows) {
+		fmt.Printf("Score: **%d/100**  \n", auditScore(rows))
+	} else {
+		fmt.Printf("Score: **n/a** (no controls evaluated)  \n")
+	}
+	fmt.Printf("Verification: **%d%%**  \n", auditVerification(rows))
 	fmt.Printf("Repositories scanned: **%d**\n\n", repoCount)
 	fmt.Println("| Severity | Status | Scope | Target | Control | Detail |")
 	fmt.Println("| --- | --- | --- | --- | --- | --- |")
@@ -479,16 +611,12 @@ func renderAuditMarkdown(rows []auditRow, repoCount int) {
 }
 
 func markdownEscape(s string) string {
-	return strings.ReplaceAll(s, "|", "\\|")
+	return strings.ReplaceAll(sanitizeDetail(s), "|", "\\|")
 }
-
-type exitError int
-
-func (e exitError) Error() string { return "" }
 
 func auditSARIF(rows []auditRow) map[string]any {
 	rules := map[string]map[string]any{}
-	var results []map[string]any
+	results := []map[string]any{} // must marshal to [] not null on a clean scan
 	for _, row := range rows {
 		if row.Status != string(StatusGap) && row.Status != string(StatusError) {
 			continue

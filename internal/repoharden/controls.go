@@ -37,13 +37,17 @@ type DetectResult struct {
 
 // Control is one baseline check. Apply/Revert are nil for report-only controls.
 type Control struct {
-	Key         string
-	Title       string
-	Severity    string
-	Remediation string
-	Detect      func(ctx context.Context, c *github.Client, owner, name string, repo *github.Repository) DetectResult
-	Apply       func(ctx context.Context, c *github.Client, owner, name string) error
-	Revert      func(ctx context.Context, c *github.Client, owner, name, prior string) error
+	Key           string
+	Title         string
+	Severity      string
+	Remediation   string
+	Detect        func(ctx context.Context, c *github.Client, owner, name string, repo *github.Repository) DetectResult
+	Apply         func(ctx context.Context, c *github.Client, owner, name string) error
+	Revert        func(ctx context.Context, c *github.Client, owner, name, prior string) error
+	ValidatePrior func(prior string) error
+	// MatchesHardened can narrow StatusCompliant when a control accepts multiple
+	// safe configurations but revert must only undo the exact one we applied.
+	MatchesHardened func(result DetectResult) bool
 }
 
 // baseline holds all the controls. the init() blocks below register them.
@@ -68,11 +72,11 @@ func selectControls(only, skip string) []Control {
 
 func selectedControls(o *opts) ([]Control, error) {
 	if err := validateControlSelection(o.only, o.skip); err != nil {
-		return nil, err
+		return nil, usageError{err}
 	}
 	controls := selectControls(o.only, o.skip)
 	if len(controls) == 0 {
-		return nil, fmt.Errorf("no controls selected")
+		return nil, usageErr("no controls selected")
 	}
 	return controls, nil
 }
@@ -134,7 +138,16 @@ func githubStatus(err error) int {
 
 func endpointUnavailable(err error) bool {
 	switch githubStatus(err) {
-	case http.StatusNotFound, http.StatusUnprocessableEntity, http.StatusForbidden:
+	case http.StatusNotFound, http.StatusUnprocessableEntity:
+		return true
+	case http.StatusForbidden:
+		var ghErr *github.ErrorResponse
+		if errors.As(err, &ghErr) && ghErr.Response != nil {
+			if ghErr.Response.Header.Get("Retry-After") != "" ||
+				ghErr.Response.Header.Get("X-RateLimit-Remaining") == "0" {
+				return false
+			}
+		}
 		return true
 	default:
 		return false
@@ -200,6 +213,75 @@ func githubStatusOrDisabled(status string) string {
 		return "disabled"
 	}
 	return status
+}
+
+func validateControlPrior(control, prior string) error {
+	enabledDisabled := func(value string) error {
+		switch value {
+		case "enabled", "disabled":
+			return nil
+		default:
+			return fmt.Errorf("invalid prior value %q", value)
+		}
+	}
+
+	switch control {
+	case "dependabot-alerts", "dependabot-fixes", "private-vulnerability-reporting":
+		return enabledDisabled(prior)
+	case "token-readonly":
+		var value workflowPermissionPrior
+		if err := json.Unmarshal([]byte(prior), &value); err != nil {
+			return fmt.Errorf("invalid workflow permission prior: %w", err)
+		}
+		if value.Default != "read" && value.Default != "write" {
+			return fmt.Errorf("invalid default workflow permission %q", value.Default)
+		}
+		return nil
+	case "actions-allowlist":
+		var value actionsAllowlistPrior
+		if err := json.Unmarshal([]byte(prior), &value); err != nil {
+			return fmt.Errorf("invalid Actions allowlist prior: %w", err)
+		}
+		switch value.AllowedActions {
+		case "all", "local_only", "selected":
+			return nil
+		default:
+			return fmt.Errorf("invalid allowed_actions value %q", value.AllowedActions)
+		}
+	case "branch-protection":
+		if prior == "" {
+			return nil
+		}
+		var value github.RepositoryRuleset
+		if err := json.Unmarshal([]byte(prior), &value); err != nil {
+			return fmt.Errorf("invalid ruleset prior: %w", err)
+		}
+		if value.Name != controlRulesetName {
+			return fmt.Errorf("ruleset prior has unexpected name %q", value.Name)
+		}
+		return nil
+	case "secret-scanning":
+		var value secretScanningPrior
+		if err := json.Unmarshal([]byte(prior), &value); err != nil {
+			return fmt.Errorf("invalid secret scanning prior: %w", err)
+		}
+		if err := enabledDisabled(value.SecretScanning); err != nil {
+			return fmt.Errorf("secret scanning: %w", err)
+		}
+		if err := enabledDisabled(value.PushProtection); err != nil {
+			return fmt.Errorf("push protection: %w", err)
+		}
+		return nil
+	case "code-scanning":
+		switch prior {
+		case "configured", "not-configured":
+			return nil
+		default:
+			return fmt.Errorf("invalid CodeQL prior %q", prior)
+		}
+	default:
+		return fmt.Errorf("control %q has no prior validator", control)
+	}
 }
 
 func init() {
@@ -271,6 +353,12 @@ func init() {
 				if err != nil {
 					return detectErr(err)
 				}
+				if p == nil { // empty 200 body leaves p nil; raw field reads below would panic
+					return DetectResult{Status: StatusError, Detail: "empty workflow-permissions response"}
+				}
+				if p.GetDefaultWorkflowPermissions() == "" || p.CanApprovePullRequestReviews == nil {
+					return DetectResult{Status: StatusSkipped, Detail: "workflow permission fields are not fully visible"}
+				}
 				prior := workflowPermissionPrior{
 					Default:    p.GetDefaultWorkflowPermissions(),
 					CanApprove: p.CanApprovePullRequestReviews,
@@ -315,9 +403,15 @@ func init() {
 			if err != nil {
 				return detectErr(err)
 			}
+			if p == nil || p.Enabled == nil {
+				return DetectResult{Status: StatusSkipped, Detail: "Actions enabled setting is not visible"}
+			}
 			if !p.GetEnabled() {
 				// actions are off for this repo, don't silently turn them on.
 				return DetectResult{Status: StatusSkipped, Detail: "Actions disabled for this repository"}
+			}
+			if p.GetAllowedActions() == "" {
+				return DetectResult{Status: StatusError, Detail: "Actions allowed_actions field is missing"}
 			}
 			prior := actionsAllowlistPrior{Enabled: p.Enabled, AllowedActions: p.GetAllowedActions()}
 			if p.GetAllowedActions() != "selected" {
@@ -326,6 +420,9 @@ func init() {
 			allowed, _, err := c.Repositories.GetActionsAllowed(ctx, owner, name)
 			if err != nil {
 				return detectErr(err)
+			}
+			if allowed == nil { // empty 200 body; raw field reads below would panic
+				return DetectResult{Status: StatusError, Detail: "empty actions-allowed response"}
 			}
 			prior.GithubOwnedAllowed = allowed.GithubOwnedAllowed
 			prior.VerifiedAllowed = allowed.VerifiedAllowed
@@ -384,7 +481,7 @@ func init() {
 		Severity:    "high",
 		Remediation: "Protect the default branch with PR review, non-fast-forward protection, and linear history.",
 		Detect: func(ctx context.Context, c *github.Client, owner, name string, repo *github.Repository) DetectResult {
-			sets, _, err := c.Repositories.GetAllRulesets(ctx, owner, name, nil)
+			sets, err := allRepoRulesets(ctx, c, owner, name, false)
 			if err != nil {
 				return detectErr(err)
 			}
@@ -395,6 +492,9 @@ func init() {
 				full, _, err := c.Repositories.GetRuleset(ctx, owner, name, rs.GetID(), false)
 				if err != nil {
 					return detectErr(err)
+				}
+				if full == nil { // can't safely capture/replace a ruleset we couldn't read
+					return DetectResult{Status: StatusError, Detail: "could not read existing ruleset named " + controlRulesetName}
 				}
 				if managedRulesetValid(full, repo.GetDefaultBranch()) {
 					return DetectResult{Status: StatusCompliant}
@@ -426,19 +526,21 @@ func init() {
 			}
 			// if a same-name ruleset exists, update in place (no delete/create gap),
 			// otherwise create it. detect already grabbed the prior for revert.
-			if sets, _, err := c.Repositories.GetAllRulesets(ctx, owner, name, nil); err == nil {
-				for _, rs := range sets {
-					if rs.Name == controlRulesetName {
-						_, _, err := c.Repositories.UpdateRuleset(ctx, owner, name, rs.GetID(), spec)
-						return err
-					}
+			sets, err := allRepoRulesets(ctx, c, owner, name, false)
+			if err != nil {
+				return fmt.Errorf("confirm existing managed ruleset before mutation: %w", err)
+			}
+			for _, rs := range sets {
+				if rs.Name == controlRulesetName {
+					_, _, err := c.Repositories.UpdateRuleset(ctx, owner, name, rs.GetID(), spec)
+					return err
 				}
 			}
-			_, _, err := c.Repositories.CreateRuleset(ctx, owner, name, spec)
+			_, _, err = c.Repositories.CreateRuleset(ctx, owner, name, spec)
 			return err
 		},
 		Revert: func(ctx context.Context, c *github.Client, owner, name, prior string) error {
-			sets, _, err := c.Repositories.GetAllRulesets(ctx, owner, name, nil)
+			sets, err := allRepoRulesets(ctx, c, owner, name, false)
 			if err != nil {
 				return err
 			}
@@ -453,7 +555,7 @@ func init() {
 				return nil // nothing of ours to undo
 			}
 			// if harden replaced an existing same-name ruleset, put it back; else delete ours.
-			if strings.TrimSpace(prior) != "" {
+			if s := strings.TrimSpace(prior); s != "" && s != "null" {
 				var captured github.RepositoryRuleset
 				if err := json.Unmarshal([]byte(prior), &captured); err == nil && captured.Name != "" {
 					_, _, err := c.Repositories.UpdateRuleset(ctx, owner, name, id, github.RepositoryRuleset{
@@ -552,7 +654,10 @@ func init() {
 				ref := "refs/heads/" + repo.GetDefaultBranch()
 				analyses, _, aerr := c.CodeScanning.ListAnalysesForRepo(ctx, owner, name,
 					&github.AnalysesListOptions{Ref: github.Ptr(ref), ListOptions: github.ListOptions{PerPage: 1}})
-				if aerr == nil && len(analyses) > 0 {
+				if aerr != nil {
+					return detectErr(aerr)
+				}
+				if len(analyses) > 0 {
 					if time.Since(analyses[0].GetCreatedAt().Time) < codeScanningFreshness {
 						return DetectResult{Status: StatusCompliant, Detail: "recent code scanning analysis on default branch (advanced/workflow setup)"}
 					}
@@ -572,6 +677,9 @@ func init() {
 				_, _, err := c.CodeScanning.UpdateDefaultSetupConfiguration(ctx, owner, name,
 					&github.UpdateDefaultSetupConfigurationOptions{State: "not-configured"})
 				return err
+			},
+			MatchesHardened: func(result DetectResult) bool {
+				return result.Status == StatusCompliant && result.Prior == "configured"
 			},
 		},
 	)
@@ -664,7 +772,13 @@ func init() {
 // cmdControls lists the baseline controls and whether they're auto-fixable/revertable.
 func cmdControls(o *opts) error {
 	fmt.Println(colorize(o, colorGo, "repo-harden baseline controls"))
-	fmt.Printf("%-22s %-9s %-12s %s\n", "KEY", "SEVERITY", "ACTION", "REVERSIBLE")
+	keyWidth := len("KEY")
+	for _, ctl := range baseline {
+		if len(ctl.Key) > keyWidth {
+			keyWidth = len(ctl.Key)
+		}
+	}
+	fmt.Printf("%-*s  %-9s %-12s %s\n", keyWidth, "KEY", "SEVERITY", "ACTION", "REVERSIBLE")
 	for _, ctl := range baseline {
 		action := "report-only"
 		if ctl.Apply != nil {
@@ -674,7 +788,7 @@ func cmdControls(o *opts) error {
 		if ctl.Revert != nil {
 			reversible = "yes"
 		}
-		fmt.Printf("%-22s %-9s %-12s %s\n", ctl.Key, ctl.Severity, action, reversible)
+		fmt.Printf("%-*s  %-9s %-12s %s\n", keyWidth, ctl.Key, ctl.Severity, action, reversible)
 	}
 	fmt.Printf("\n%d baseline controls (harden/revert). audit additionally runs %d read-only checks.\n",
 		len(baseline), len(auditControlKeys())-len(baseline))
