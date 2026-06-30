@@ -159,6 +159,16 @@ func TestGitHubCommunityHealthFlagsMissing(t *testing.T) {
 	}
 }
 
+func TestGitHubCommunityHealthAcceptsCompleteProfileWithIssueForm(t *testing.T) {
+	client := mockClient(map[string]string{
+		"GET /repos/me/app/community/profile": `{"health_percentage":100,"files":{"readme":{"url":"x"},"license":{"url":"x"},"code_of_conduct":{"url":"x"},"contributing":{"url":"x"},"issue_template":null,"pull_request_template":{"url":"x"}}}`,
+	})
+	row := auditGitHubCommunityHealth(context.Background(), client, "me", "app", &github.Repository{FullName: github.Ptr("me/app")})
+	if row.Status != string(StatusCompliant) {
+		t.Fatalf("status = %s detail=%q, want compliant", row.Status, row.Detail)
+	}
+}
+
 func TestGitHubRequiredWorkflowsSkipsPersonalRepository(t *testing.T) {
 	repo := &github.Repository{
 		FullName: github.Ptr("me/app"),

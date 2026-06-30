@@ -1271,6 +1271,11 @@ func auditGitHubCommunityHealth(ctx context.Context, c *github.Client, owner, na
 	if m == nil || m.Files == nil {
 		return githubAuditRow(repo, key, title, "low", StatusSkipped, "community profile not available", rem)
 	}
+	// GitHub counts issue forms toward a complete profile but may omit them
+	// from files.issue_template in the Community Profile API response.
+	if m.GetHealthPercentage() == 100 {
+		return githubAuditRow(repo, key, title, "low", StatusCompliant, "community health 100%", rem)
+	}
 	f := m.Files
 	var missing []string
 	if f.IssueTemplate == nil {

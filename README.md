@@ -192,8 +192,21 @@ repo-harden started as a hobby project — a tool I built for my own repositorie
 
 ## Production operations
 
-Repository policy, provider smoke tests, and the release checklist are
-documented in [docs/PRODUCTION.md](docs/PRODUCTION.md).
+Before tagging a release:
+
+1. Confirm the protected `main` commit has passed CI and CodeQL.
+2. Verify the branch/tag rulesets, restricted Actions policy, read-only
+   `GITHUB_TOKEN`, secret scanning, push protection, and private vulnerability
+   reporting in GitHub.
+3. Run read-only audit smoke tests against disposable GitHub.com, GHES, GitLab,
+   Gitea, and Forgejo projects. On GitHub.com, also exercise `harden --dry-run`,
+   apply, and `revert` while checking state recovery after a partial failure.
+4. Verify the release contains Linux, macOS, and Windows archives, checksums,
+   per-archive SBOMs, and build-provenance attestations. Install and smoke-test
+   one archive on each supported operating-system family.
+
+Provider smoke tests require external instances and credentials and therefore
+cannot be verified by pull-request CI alone.
 
 ## Contributing
 
