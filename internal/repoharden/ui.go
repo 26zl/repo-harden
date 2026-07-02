@@ -5,6 +5,8 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -231,3 +233,73 @@ func truncate(s string, n int) string {
 }
 
 func runeCount(s string) int { return utf8.RuneCountInString(s) }
+
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+type spinner struct {
+	w      io.Writer
+	mu     sync.Mutex
+	stop   chan struct{}
+	done   chan struct{}
+	active bool
+}
+
+var activeSpinner *spinner
+
+// startSpinner shows a working indicator on stderr in an interactive terminal until stopSpinner is called.
+func startSpinner(o *opts, label string) {
+	if !spinnerEnabled(o) {
+		return
+	}
+	activeSpinner = newSpinner(os.Stderr, label)
+}
+
+func stopSpinner() { activeSpinner.Stop() }
+
+func spinnerEnabled(o *opts) bool {
+	if o != nil && (o.noColor || strings.ToLower(o.color) == "never") {
+		return false
+	}
+	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
+		return false
+	}
+	info, err := os.Stderr.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+func newSpinner(w io.Writer, label string) *spinner {
+	s := &spinner{w: w, stop: make(chan struct{}), done: make(chan struct{}), active: true}
+	go s.run(label)
+	return s
+}
+
+func (s *spinner) run(label string) {
+	defer close(s.done)
+	fmt.Fprint(s.w, "\x1b[?25l")
+	t := time.NewTicker(90 * time.Millisecond)
+	defer t.Stop()
+	for i := 0; ; i++ {
+		fmt.Fprintf(s.w, "\r%s%s%s %s%s%s", colorGo, spinnerFrames[i%len(spinnerFrames)], colorReset, colorGray, label, colorReset)
+		select {
+		case <-s.stop:
+			return
+		case <-t.C:
+		}
+	}
+}
+
+func (s *spinner) Stop() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if !s.active {
+		s.mu.Unlock()
+		return
+	}
+	s.active = false
+	s.mu.Unlock()
+	close(s.stop)
+	<-s.done
+	fmt.Fprint(s.w, "\r\x1b[K\x1b[?25h")
+}

@@ -148,6 +148,11 @@ func Main() {
 
 	maybePrintBanner(o)
 
+	if cmd != "controls" {
+		startSpinner(o, "working…")
+		defer stopSpinner()
+	}
+
 	switch cmd {
 	case "list":
 		err = cmdList(ctx, client, o)
@@ -175,6 +180,7 @@ func Main() {
 		fmt.Fprintf(os.Stderr, "repo-harden: unknown command %q; run 'repo-harden help'\n", cmd)
 		os.Exit(2)
 	}
+	stopSpinner()
 	if err != nil {
 		var ue usageError
 		if errors.As(err, &ue) {
@@ -634,6 +640,7 @@ type listRow struct {
 }
 
 func collectRows(ctx context.Context, c *github.Client, o *opts, repos []*github.Repository) ([]listRow, int, error) {
+	stopSpinner()
 	var (
 		mu         sync.Mutex
 		rows       []listRow
@@ -706,6 +713,7 @@ func cmdDisableAll(ctx context.Context, c *github.Client, o *opts) error {
 	if err != nil {
 		return err
 	}
+	stopSpinner()
 
 	statePath, err := stateFilePath(o)
 	if err != nil {
@@ -882,6 +890,7 @@ func cmdEnableAll(ctx context.Context, c *github.Client, o *opts) error {
 	if len(selected) == 0 {
 		return usageErr("no Actions state entries match the requested repository scope")
 	}
+	stopSpinner()
 
 	var (
 		mu         sync.Mutex
@@ -965,6 +974,7 @@ func cmdEnableAllDisabled(ctx context.Context, c *github.Client, o *opts) error 
 	if err != nil {
 		return err
 	}
+	stopSpinner()
 	var (
 		mu         sync.Mutex
 		changed    int
@@ -1039,6 +1049,7 @@ func cmdToggleRepo(ctx context.Context, c *github.Client, o *opts, args []string
 	if err != nil {
 		return err
 	}
+	stopSpinner()
 
 	wantState := "active"
 	if action == "enable" {

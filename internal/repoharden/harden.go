@@ -94,6 +94,7 @@ func (r *hardenRecorder) remove(e HardenEntry) error {
 }
 
 func collectHarden(ctx context.Context, c *github.Client, o *opts, repos []*github.Repository, recorder *hardenRecorder) (applied, skipped, failed int, err error) {
+	stopSpinner()
 	controls, err := selectedControls(o)
 	if err != nil {
 		return 0, 0, 0, err
@@ -282,6 +283,7 @@ func matchesHardenedState(ctl Control, result DetectResult) bool {
 }
 
 func revertEntries(ctx context.Context, c *github.Client, o *opts, entries []HardenEntry) []HardenEntry {
+	stopSpinner()
 	cm := controlMap()
 	var mu sync.Mutex
 	var remaining []HardenEntry

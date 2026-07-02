@@ -1,10 +1,25 @@
 package repoharden
 
 import (
+	"io"
 	"strings"
 	"testing"
 	"unicode/utf8"
 )
+
+func TestSpinnerStopIsIdempotentAndNilSafe(t *testing.T) {
+	var nilSp *spinner
+	nilSp.Stop()  // nil receiver must not panic
+	stopSpinner() // activeSpinner is nil in tests
+
+	s := newSpinner(io.Discard, "working…")
+	s.Stop()
+	s.Stop() // second Stop must not hang or panic
+
+	if spinnerEnabled(&opts{noColor: true}) {
+		t.Error("--no-color must disable the spinner")
+	}
+}
 
 func TestColorGating(t *testing.T) {
 	if got := glyph(&opts{noColor: true}, "compliant"); strings.Contains(got, "\x1b") {

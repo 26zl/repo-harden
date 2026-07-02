@@ -412,6 +412,7 @@ func auditHasSkipped(rows []auditRow) bool {
 }
 
 func renderAudit(rows []auditRow, repoCount int, o *opts) error {
+	stopSpinner()
 	switch o.format {
 	case "json":
 		return json.NewEncoder(os.Stdout).Encode(rows)
