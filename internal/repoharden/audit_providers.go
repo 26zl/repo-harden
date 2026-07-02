@@ -80,9 +80,9 @@ func collectGitLabAudit(ctx context.Context, o *opts) ([]auditRow, int, error) {
 				{"repo-secrets", func() auditRow {
 					return auditGitLabVariables(groupCtx, client, p, o.showIdentifiers)
 				}},
-				{"deploy-keys", func() auditRow { return auditGitLabDeployKeys(groupCtx, client, p) }},
+				{"deploy-keys", func() auditRow { return auditGitLabDeployKeys(groupCtx, client, p, o.showIdentifiers) }},
 				{"webhooks", func() auditRow { return auditGitLabWebhooks(groupCtx, client, p) }},
-				{"collaborators", func() auditRow { return auditGitLabCollaborators(groupCtx, client, p) }},
+				{"collaborators", func() auditRow { return auditGitLabCollaborators(groupCtx, client, p, o.showIdentifiers) }},
 				{"vulnerability-alert-count", func() auditRow { return auditGitLabVulnerabilities(groupCtx, client, p) }},
 				{"releases", func() auditRow { return auditGitLabReleases(groupCtx, client, p) }},
 				{"packages", func() auditRow { return auditGitLabPackages(groupCtx, client, p) }},
@@ -383,7 +383,7 @@ type gitlabMember struct {
 	AccessLevel int    `json:"access_level"`
 }
 
-func auditGitLabDeployKeys(ctx context.Context, c *restClient, p gitlabProject) auditRow {
+func auditGitLabDeployKeys(ctx context.Context, c *restClient, p gitlabProject, showIdentifiers bool) auditRow {
 	keys, err := gitlabPaged[gitlabDeployKey](ctx, c, gitlabProjectPath(p, "/deploy_keys"), nil)
 	if err != nil {
 		if httpUnavailable(err) {
@@ -398,7 +398,11 @@ func auditGitLabDeployKeys(ctx context.Context, c *restClient, p gitlabProject) 
 		}
 	}
 	if len(writable) > 0 {
-		return providerRow("gitlab", "repo", p.PathWithNamespace, "deploy-keys", "Deploy keys are read-only or absent", "high", StatusGap, "writable deploy keys: "+strings.Join(limitStrings(writable, maxDetailItems), ", "), "Remove unused deploy keys and disable write access.")
+		detail := fmt.Sprintf("%d writable deploy keys", len(writable))
+		if showIdentifiers {
+			detail += ": " + strings.Join(limitStrings(writable, maxDetailItems), ", ")
+		}
+		return providerRow("gitlab", "repo", p.PathWithNamespace, "deploy-keys", "Deploy keys are read-only or absent", "high", StatusGap, detail, "Remove unused deploy keys and disable write access.")
 	}
 	return providerRow("gitlab", "repo", p.PathWithNamespace, "deploy-keys", "Deploy keys are read-only or absent", "high", StatusCompliant, fmt.Sprintf("%d deploy keys, none writable", len(keys)), "Remove unused deploy keys and disable write access.")
 }
@@ -426,7 +430,7 @@ func auditGitLabWebhooks(ctx context.Context, c *restClient, p gitlabProject) au
 // gitlabMaintainer is GitLab's access_level for Maintainer; >= this is privileged.
 const gitlabMaintainer = 40
 
-func auditGitLabCollaborators(ctx context.Context, c *restClient, p gitlabProject) auditRow {
+func auditGitLabCollaborators(ctx context.Context, c *restClient, p gitlabProject, showIdentifiers bool) auditRow {
 	members, err := gitlabPaged[gitlabMember](ctx, c, gitlabProjectPath(p, "/members"), nil)
 	if err != nil {
 		if httpUnavailable(err) {
@@ -441,7 +445,11 @@ func auditGitLabCollaborators(ctx context.Context, c *restClient, p gitlabProjec
 		}
 	}
 	if len(privileged) > 0 {
-		return providerRow("gitlab", "repo", p.PathWithNamespace, "collaborators", "Direct maintainers/owners are reviewed", "medium", StatusGap, "direct maintainers/owners: "+strings.Join(limitStrings(privileged, maxDetailItems), ", "), "Prefer group-managed access and remove stale direct maintainers.")
+		detail := fmt.Sprintf("%d direct maintainers/owners", len(privileged))
+		if showIdentifiers {
+			detail += ": " + strings.Join(limitStrings(privileged, maxDetailItems), ", ")
+		}
+		return providerRow("gitlab", "repo", p.PathWithNamespace, "collaborators", "Direct maintainers/owners are reviewed", "medium", StatusGap, detail, "Prefer group-managed access and remove stale direct maintainers.")
 	}
 	return providerRow("gitlab", "repo", p.PathWithNamespace, "collaborators", "Direct maintainers/owners are reviewed", "medium", StatusCompliant, "no direct maintainers/owners listed", "Prefer group-managed access and remove stale direct maintainers.")
 }
@@ -554,9 +562,9 @@ func collectGiteaAudit(ctx context.Context, o *opts) ([]auditRow, int, error) {
 				}},
 				{"required-workflows", func() auditRow { return auditGiteaWorkflows(groupCtx, client, prov, repo) }},
 				{"repo-secrets", func() auditRow { return auditGiteaSecrets(groupCtx, client, prov, repo) }},
-				{"deploy-keys", func() auditRow { return auditGiteaDeployKeys(groupCtx, client, prov, repo) }},
+				{"deploy-keys", func() auditRow { return auditGiteaDeployKeys(groupCtx, client, prov, repo, o.showIdentifiers) }},
 				{"webhooks", func() auditRow { return auditGiteaWebhooks(groupCtx, client, prov, repo) }},
-				{"collaborators", func() auditRow { return auditGiteaCollaborators(groupCtx, client, prov, repo) }},
+				{"collaborators", func() auditRow { return auditGiteaCollaborators(groupCtx, client, prov, repo, o.showIdentifiers) }},
 				{"releases", func() auditRow { return auditGiteaReleases(groupCtx, client, prov, repo) }},
 				{"signed-commits", func() auditRow {
 					return providerRow(prov, "repo", repo.FullName, "signed-commits", "Signed commits required", "medium", StatusSkipped, "no portable signed-commit API found", "Use branch protection/rulesets if your instance supports signed commits.")
@@ -757,7 +765,7 @@ type giteaCollab struct {
 	Permission string `json:"permission"`
 }
 
-func auditGiteaDeployKeys(ctx context.Context, c *restClient, provider string, repo giteaRepo) auditRow {
+func auditGiteaDeployKeys(ctx context.Context, c *restClient, provider string, repo giteaRepo, showIdentifiers bool) auditRow {
 	keys, err := giteaPaged[giteaDeployKey](ctx, c, giteaRepoPath(repo, "/keys"))
 	if err != nil {
 		if httpUnavailable(err) {
@@ -772,7 +780,11 @@ func auditGiteaDeployKeys(ctx context.Context, c *restClient, provider string, r
 		}
 	}
 	if len(writable) > 0 {
-		return providerRow(provider, "repo", repo.FullName, "deploy-keys", "Deploy keys are read-only or absent", "high", StatusGap, "writable deploy keys: "+strings.Join(limitStrings(writable, maxDetailItems), ", "), "Remove unused deploy keys and disable write access.")
+		detail := fmt.Sprintf("%d writable deploy keys", len(writable))
+		if showIdentifiers {
+			detail += ": " + strings.Join(limitStrings(writable, maxDetailItems), ", ")
+		}
+		return providerRow(provider, "repo", repo.FullName, "deploy-keys", "Deploy keys are read-only or absent", "high", StatusGap, detail, "Remove unused deploy keys and disable write access.")
 	}
 	return providerRow(provider, "repo", repo.FullName, "deploy-keys", "Deploy keys are read-only or absent", "high", StatusCompliant, fmt.Sprintf("%d deploy keys, none writable", len(keys)), "Remove unused deploy keys and disable write access.")
 }
@@ -797,7 +809,7 @@ func auditGiteaWebhooks(ctx context.Context, c *restClient, provider string, rep
 	return providerRow(provider, "repo", repo.FullName, "webhooks", "Webhooks use TLS and active hooks are reviewed", "medium", StatusCompliant, fmt.Sprintf("%d webhooks reviewed", len(hooks)), "Require HTTPS and TLS verification for webhooks.")
 }
 
-func auditGiteaCollaborators(ctx context.Context, c *restClient, provider string, repo giteaRepo) auditRow {
+func auditGiteaCollaborators(ctx context.Context, c *restClient, provider string, repo giteaRepo, showIdentifiers bool) auditRow {
 	collabs, err := giteaPaged[giteaCollab](ctx, c, giteaRepoPath(repo, "/collaborators"))
 	if err != nil {
 		if httpUnavailable(err) {
@@ -812,7 +824,11 @@ func auditGiteaCollaborators(ctx context.Context, c *restClient, provider string
 		}
 	}
 	if len(admins) > 0 {
-		return providerRow(provider, "repo", repo.FullName, "collaborators", "Collaborators are reviewed", "medium", StatusGap, "direct admins/owners: "+strings.Join(limitStrings(admins, maxDetailItems), ", "), "Review direct collaborators and remove stale admins.")
+		detail := fmt.Sprintf("%d direct admins/owners", len(admins))
+		if showIdentifiers {
+			detail += ": " + strings.Join(limitStrings(admins, maxDetailItems), ", ")
+		}
+		return providerRow(provider, "repo", repo.FullName, "collaborators", "Collaborators are reviewed", "medium", StatusGap, detail, "Review direct collaborators and remove stale admins.")
 	}
 	return providerRow(provider, "repo", repo.FullName, "collaborators", "Collaborators are reviewed", "medium", StatusCompliant, fmt.Sprintf("%d collaborators reviewed", len(collabs)), "Review direct collaborators and remove stale admins.")
 }

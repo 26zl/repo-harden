@@ -54,7 +54,7 @@ func collectGitHubExtendedAudit(ctx context.Context, c *github.Client, o *opts, 
 				{"repo-secrets", func() auditRow {
 					return auditGitHubRepoSecrets(ctx, c, owner, name, repo, o.staleDays, o.showIdentifiers)
 				}},
-				{"deploy-keys", func() auditRow { return auditGitHubDeployKeys(ctx, c, owner, name, repo) }},
+				{"deploy-keys", func() auditRow { return auditGitHubDeployKeys(ctx, c, owner, name, repo, o.showIdentifiers) }},
 				{"webhooks", func() auditRow { return auditGitHubWebhooks(ctx, c, owner, name, repo) }},
 				{"collaborators", func() auditRow { return auditGitHubCollaborators(ctx, c, owner, name, repo) }},
 				{"vulnerability-alert-count", func() auditRow { return auditGitHubVulnerabilityCounts(ctx, c, owner, name, repo) }},
@@ -540,7 +540,7 @@ func auditGitHubRepoSecrets(ctx context.Context, c *github.Client, owner, name s
 	return githubAuditRow(repo, "repo-secrets", "Repository secrets are reviewed and rotated", "medium", StatusCompliant, fmt.Sprintf("%d repository secrets", total), "Rotate stale secrets and move shared secrets to org or environment scope where possible.")
 }
 
-func auditGitHubDeployKeys(ctx context.Context, c *github.Client, owner, name string, repo *github.Repository) auditRow {
+func auditGitHubDeployKeys(ctx context.Context, c *github.Client, owner, name string, repo *github.Repository, showIdentifiers bool) auditRow {
 	keys, err := listGitHubDeployKeys(ctx, c, owner, name)
 	if err != nil {
 		return githubAuditErr(repo, "deploy-keys", "Deploy keys are read-only or absent", "high", err, "Remove unused deploy keys and make remaining keys read-only.")
@@ -552,7 +552,11 @@ func auditGitHubDeployKeys(ctx context.Context, c *github.Client, owner, name st
 		}
 	}
 	if len(writable) > 0 {
-		return githubAuditRow(repo, "deploy-keys", "Deploy keys are read-only or absent", "high", StatusGap, "writable deploy keys: "+strings.Join(limitStrings(writable, maxDetailItems), ", "), "Remove unused deploy keys and make remaining keys read-only.")
+		detail := fmt.Sprintf("%d writable deploy keys", len(writable))
+		if showIdentifiers {
+			detail += ": " + strings.Join(limitStrings(writable, maxDetailItems), ", ")
+		}
+		return githubAuditRow(repo, "deploy-keys", "Deploy keys are read-only or absent", "high", StatusGap, detail, "Remove unused deploy keys and make remaining keys read-only.")
 	}
 	return githubAuditRow(repo, "deploy-keys", "Deploy keys are read-only or absent", "high", StatusCompliant, fmt.Sprintf("%d deploy keys, none writable", len(keys)), "Remove unused deploy keys and make remaining keys read-only.")
 }
@@ -904,7 +908,7 @@ func auditGitHubOrganizations(ctx context.Context, c *github.Client, repos []*gi
 			rows = append(rows, auditGitHubOrg2FADisabledMembers(ctx, c, org))
 		}
 		if want("org-outside-collaborators") {
-			rows = append(rows, auditGitHubOrgOutsideCollaborators(ctx, c, org))
+			rows = append(rows, auditGitHubOrgOutsideCollaborators(ctx, c, org, showIdentifiers))
 		}
 	}
 	return rows
@@ -1413,7 +1417,7 @@ func auditGitHubWikiSurface(repo *github.Repository) auditRow {
 	return githubAuditRow(repo, key, title, "low", StatusCompliant, "no public open wiki", rem)
 }
 
-func auditGitHubOrgOutsideCollaborators(ctx context.Context, c *github.Client, org string) auditRow {
+func auditGitHubOrgOutsideCollaborators(ctx context.Context, c *github.Client, org string, showIdentifiers bool) auditRow {
 	const (
 		key   = "org-outside-collaborators"
 		title = "Outside collaborators are reviewed"
@@ -1438,7 +1442,11 @@ func auditGitHubOrgOutsideCollaborators(ctx context.Context, c *github.Client, o
 		opts.Page = resp.NextPage
 	}
 	if len(names) > 0 {
-		return githubOrgAuditRow(org, key, title, "medium", StatusGap, fmt.Sprintf("%d outside collaborator(s) to review: %s", len(names), strings.Join(limitStrings(names, maxDetailItems), ", ")), rem)
+		detail := fmt.Sprintf("%d outside collaborator(s) to review", len(names))
+		if showIdentifiers {
+			detail += ": " + strings.Join(limitStrings(names, maxDetailItems), ", ")
+		}
+		return githubOrgAuditRow(org, key, title, "medium", StatusGap, detail, rem)
 	}
 	return githubOrgAuditRow(org, key, title, "medium", StatusCompliant, "no outside collaborators", rem)
 }

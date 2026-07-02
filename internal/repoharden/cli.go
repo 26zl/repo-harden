@@ -109,9 +109,6 @@ func Main() {
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		os.Exit(2)
 	}
-	if o.concurrency < 1 {
-		o.concurrency = 1
-	}
 	if err := validateColorMode(o.color); err != nil {
 		dieUsage(err)
 	}
@@ -281,7 +278,8 @@ Options:
   --state-file <path>        Override default state file location
   --only <keys>              Only run these controls (comma-separated keys)
   --skip <keys>              Skip these controls (comma-separated keys)
-  --show-identifiers         Include secret/variable names in audit output
+  --show-identifiers         Include secret/variable, collaborator, and
+                             deploy-key names in audit output
 
 Env:
   REPO_HARDEN_STATE_DIR      State directory (default: ~/.repo-harden)
@@ -376,6 +374,9 @@ func validateOptions(o *opts) error {
 	}
 	if o.staleDays > 36500 {
 		return fmt.Errorf("--stale-days must be <= 36500")
+	}
+	if o.concurrency < 1 {
+		return fmt.Errorf("--concurrency must be >= 1")
 	}
 	if o.concurrency > maxConcurrency {
 		return fmt.Errorf("--concurrency must be <= %d", maxConcurrency)

@@ -175,7 +175,7 @@ func collectHarden(ctx context.Context, c *github.Client, o *opts, repos []*gith
 					}
 					mu.Lock()
 					failed++
-					fmt.Fprintf(os.Stderr, "  %s %s :: %s: %v\n", actionLabel(o, "FAILED"), r.GetFullName(), ctl.Key, err)
+					fmt.Fprintf(os.Stderr, "  %s %s :: %s: %s\n", actionLabel(o, "FAILED"), r.GetFullName(), ctl.Key, sanitizeDetail(err.Error()))
 					mu.Unlock()
 					continue
 				}
@@ -307,7 +307,7 @@ func revertEntries(ctx context.Context, c *github.Client, o *opts, entries []Har
 			if err != nil {
 				mu.Lock()
 				remaining = append(remaining, e)
-				fmt.Fprintf(os.Stderr, "  %s %s :: %s: verify live state before revert: %v\n", actionLabel(o, "FAILED"), e.Repo, e.Control, err)
+				fmt.Fprintf(os.Stderr, "  %s %s :: %s: verify live state before revert: %s\n", actionLabel(o, "FAILED"), e.Repo, e.Control, sanitizeDetail(err.Error()))
 				mu.Unlock()
 				return nil
 			}
@@ -330,7 +330,7 @@ func revertEntries(ctx context.Context, c *github.Client, o *opts, entries []Har
 			mu.Lock()
 			if err != nil {
 				remaining = append(remaining, e)
-				fmt.Fprintf(os.Stderr, "  %s %s :: %s: %v\n", actionLabel(o, "FAILED"), e.Repo, e.Control, err)
+				fmt.Fprintf(os.Stderr, "  %s %s :: %s: %s\n", actionLabel(o, "FAILED"), e.Repo, e.Control, sanitizeDetail(err.Error()))
 			}
 			mu.Unlock()
 			return nil

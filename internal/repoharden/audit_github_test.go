@@ -325,6 +325,24 @@ func TestRepoSecretIdentifiersAreHiddenByDefault(t *testing.T) {
 	}
 }
 
+func TestDeployKeyIdentifiersAreHiddenByDefault(t *testing.T) {
+	client := mockClient(map[string]string{
+		"GET /repos/me/app/keys": `[{"id":1,"key":"ssh-rsa a","title":"prod-server-key","read_only":false}]`,
+	})
+	repo := &github.Repository{FullName: github.Ptr("me/app")}
+	hidden := auditGitHubDeployKeys(context.Background(), client, "me", "app", repo, false)
+	if hidden.Status != string(StatusGap) {
+		t.Fatalf("status = %s detail=%q, want gap", hidden.Status, hidden.Detail)
+	}
+	if strings.Contains(hidden.Detail, "prod-server-key") {
+		t.Fatalf("deploy key title leaked by default: %q", hidden.Detail)
+	}
+	shown := auditGitHubDeployKeys(context.Background(), client, "me", "app", repo, true)
+	if !strings.Contains(shown.Detail, "prod-server-key") {
+		t.Fatalf("--show-identifiers detail missing key title: %q", shown.Detail)
+	}
+}
+
 func TestRulesetTargetsBranch(t *testing.T) {
 	mk := func(include, exclude []string) *github.RepositoryRuleset {
 		return &github.RepositoryRuleset{

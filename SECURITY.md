@@ -26,5 +26,6 @@ Cross-host redirects and HTTPS-to-HTTP downgrades are rejected.
 
 Hardening state is stored locally with mode `0600`, is bound to the forge host
 and authenticated account, and contains settings metadata but no token or
-secret values. Audit output hides secret and CI-variable names unless
-`--show-identifiers` is explicitly requested.
+secret values. Audit output hides secret and CI-variable names, collaborator
+usernames, and deploy-key titles unless `--show-identifiers` is explicitly
+requested.

@@ -601,17 +601,18 @@ func TestResolveTokenReadsStdin(t *testing.T) {
 }
 
 func TestValidateOptions(t *testing.T) {
-	ok := &opts{provider: "github", format: "table", staleDays: 1}
+	ok := &opts{provider: "github", format: "table", staleDays: 1, concurrency: 1}
 	if err := validateOptions(ok); err != nil {
 		t.Fatalf("valid opts rejected: %v", err)
 	}
 	bad := []*opts{
-		{provider: "bogus", format: "table", staleDays: 1},
-		{provider: "github", format: "xml", staleDays: 1},
-		{provider: "github", format: "table", staleDays: 0},
-		{provider: "github", format: "table", staleDays: 36501},
+		{provider: "bogus", format: "table", staleDays: 1, concurrency: 1},
+		{provider: "github", format: "xml", staleDays: 1, concurrency: 1},
+		{provider: "github", format: "table", staleDays: 0, concurrency: 1},
+		{provider: "github", format: "table", staleDays: 36501, concurrency: 1},
+		{provider: "github", format: "table", staleDays: 1, concurrency: 0},
 		{provider: "github", format: "table", staleDays: 1, concurrency: maxConcurrency + 1},
-		{provider: "gitlab", format: "table", staleDays: 1, repo: "me/app"},
+		{provider: "gitlab", format: "table", staleDays: 1, repo: "me/app", concurrency: 1},
 	}
 	for i, o := range bad {
 		if err := validateOptions(o); err == nil {

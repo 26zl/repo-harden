@@ -150,7 +150,7 @@ repo-harden audit --format sarif > out.sarif  # for GitHub code-scanning ingesti
 | `--org-audit` | Include GitHub organization-level audit checks (default; use `--org-audit=false` to disable) |
 | `--stale-days <n>` | Stale repository threshold (default: 180) |
 | `--state-file <path>` | Override the default state file path |
-| `--show-identifiers` | Include secret/CI-variable names in audit output (hidden by default) |
+| `--show-identifiers` | Include secret/CI-variable names, collaborator usernames, and deploy-key titles in audit output (hidden by default) |
 
 ## Requirements & install
 
