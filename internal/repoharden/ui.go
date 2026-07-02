@@ -16,7 +16,7 @@ const (
 	colorYellow = "\x1b[33m"
 	colorCyan   = "\x1b[36m"
 	colorGray   = "\x1b[90m"
-	colorGo     = "\x1b[38;5;38m" // Go gopher blue, 256-color so Terminal.app works
+	colorGo     = "\x1b[38;5;38m"
 )
 
 const banner = `                       _                _
@@ -25,17 +25,13 @@ const banner = `                       _                _
 |_| \___| .__/\___/   |_||_\__,_|_| \__,_\___|_||_|
         |_|`
 
-// printUsageBanner prints the ASCII wordmark and tagline to w.
 func printUsageBanner(w io.Writer) {
 	fmt.Fprintln(w, colorize(nil, colorGo, banner))
 	fmt.Fprintln(w, colorize(nil, colorGray, "  one command · every repo · reversible"))
 	fmt.Fprintln(w)
 }
 
-// sanitizeDetail strips ANSI escape sequences and control characters from
-// API-derived text (webhook URLs, repo/branch names, error strings) so it
-// cannot spoof the terminal or break table/markdown output. Bytes >= 0x80
-// (UTF-8 continuation/lead bytes) pass through untouched.
+// sanitizeDetail removes terminal control sequences from untrusted output while preserving UTF-8 bytes.
 func sanitizeDetail(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
@@ -70,7 +66,6 @@ func sanitizeDetail(s string) string {
 		case c == '\n', c == '\r', c == '\t':
 			b.WriteByte(' ')
 		case c < 0x20 || c == 0x7f:
-			// drop other control characters
 		default:
 			b.WriteByte(c)
 		}
@@ -85,8 +80,6 @@ func sanitizeDetail(s string) string {
 	return strings.TrimSpace(clean.String())
 }
 
-// maybePrintBanner shows the wordmark before a command, but only on a real
-// terminal. skip it for json/sarif/markdown so pipes stay clean.
 func maybePrintBanner(o *opts) {
 	if o != nil && (o.jsonOut || o.format == "json" || o.format == "sarif" || o.format == "markdown") {
 		return
@@ -237,5 +230,4 @@ func truncate(s string, n int) string {
 	return string([]rune(s)[:n-1]) + "…"
 }
 
-// runeCount counts runes, not display width (fine for our ASCII columns).
 func runeCount(s string) int { return utf8.RuneCountInString(s) }

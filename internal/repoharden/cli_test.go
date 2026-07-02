@@ -39,7 +39,6 @@ func TestGetNamedRepos(t *testing.T) {
 	if _, err := getNamedRepos(context.Background(), client, "bad"); err == nil {
 		t.Fatal("invalid owner/repo should error")
 	}
-	// reject extra path segments instead of 404ing on a malformed slug
 	if _, err := getNamedRepos(context.Background(), client, "a/b/c"); err == nil {
 		t.Fatal("owner/repo with extra segment should error")
 	}
@@ -72,7 +71,6 @@ func jsonResponse(body string) *http.Response {
 	}
 }
 
-// mustClient builds a test client with a custom http.Client.
 func mustClient(hc *http.Client) *github.Client {
 	c, err := github.NewClient(github.WithHTTPClient(hc))
 	if err != nil {
@@ -458,6 +456,95 @@ func TestGitHubClientDoesNotLeakTokenOnCrossHostRedirect(t *testing.T) {
 	}
 	if leaked != "" {
 		t.Fatalf("bearer token leaked to redirect target: %q", leaked)
+	}
+}
+
+func TestRequireSecureRedirectURLAllowsQuery(t *testing.T) {
+	if err := requireSecureURL("https://gitlab.example.com/api?page=2"); err == nil {
+		t.Fatal("a base URL carrying a query must be rejected")
+	}
+	if err := requireSecureRedirectURL("https://gitlab.example.com/api?page=2"); err != nil {
+		t.Fatalf("a redirect target carrying a query must be allowed: %v", err)
+	}
+	if err := requireSecureRedirectURL("http://evil.example.com/api"); err == nil {
+		t.Fatal("cleartext http to a non-loopback host must still be refused on redirect")
+	}
+	if err := requireSecureRedirectURL("https://u:p@h.example.com/x"); err == nil {
+		t.Fatal("userinfo must still be refused on redirect")
+	}
+}
+
+func TestSameHostRedirectWithQueryAllowed(t *testing.T) {
+	orig, _ := http.NewRequest(http.MethodGet, "https://gitlab.example.com/api/v4/projects", nil)
+	target, _ := http.NewRequest(http.MethodGet, "https://gitlab.example.com/api/v4/projects?page=2&per_page=100", nil)
+	if err := noCrossHostRedirect(target, []*http.Request{orig}); err != nil {
+		t.Fatalf("a same-host redirect carrying a query string must be allowed: %v", err)
+	}
+}
+
+func TestHostScopedHeaderStripsOffHost(t *testing.T) {
+	var seen string
+	base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		seen = req.Header.Get("PRIVATE-TOKEN")
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: req}, nil
+	})
+	rt := &hostScopedHeader{header: "PRIVATE-TOKEN", host: "gitlab.example.com", base: base}
+
+	same, _ := http.NewRequest(http.MethodGet, "https://gitlab.example.com/x", nil)
+	same.Header.Set("PRIVATE-TOKEN", "secret")
+	if _, err := rt.RoundTrip(same); err != nil {
+		t.Fatal(err)
+	}
+	if seen != "secret" {
+		t.Fatalf("same-host request should keep the token header, got %q", seen)
+	}
+
+	off, _ := http.NewRequest(http.MethodGet, "https://evil.example.com/x", nil)
+	off.Header.Set("PRIVATE-TOKEN", "secret")
+	if _, err := rt.RoundTrip(off); err != nil {
+		t.Fatal(err)
+	}
+	if seen != "" {
+		t.Fatalf("off-host request must have the token header stripped, got %q", seen)
+	}
+}
+
+func TestCollectRowsReportsUnreadableRepos(t *testing.T) {
+	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(req.URL.Path, "/actions/workflows") {
+			if strings.Contains(req.URL.Path, "good") {
+				return jsonResponse(`{"total_count":1,"workflows":[{"id":1,"name":"CI","path":"p","state":"active"}]}`), nil
+			}
+			return &http.Response{StatusCode: http.StatusInternalServerError, Status: "500 err", Header: make(http.Header), Body: http.NoBody, Request: req}, nil
+		}
+		return jsonResponse(`{}`), nil
+	})})
+	repos := []*github.Repository{
+		{FullName: github.Ptr("me/good")},
+		{FullName: github.Ptr("me/bad")},
+	}
+	rows, repoErrors, err := collectRows(context.Background(), client, &opts{concurrency: 1}, repos)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || repoErrors != 1 {
+		t.Fatalf("rows=%d repoErrors=%d, want 1 and 1", len(rows), repoErrors)
+	}
+}
+
+func TestCmdStatusCountsWorkflowStates(t *testing.T) {
+	client := mockClient(map[string]string{
+		"GET /user":                           `{"login":"me"}`,
+		"GET /repos/me/app":                   `{"full_name":"me/app","owner":{"login":"me"}}`,
+		"GET /repos/me/app/actions/workflows": `{"total_count":2,"workflows":[{"id":1,"name":"CI","path":"a","state":"active"},{"id":2,"name":"Old","path":"b","state":"disabled_manually"}]}`,
+	})
+	out := captureStdout(t, func() {
+		if err := cmdStatus(context.Background(), client, &opts{repo: "me/app", jsonOut: true, concurrency: 1}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, `"active":1`) || !strings.Contains(out, `"disabled_manually":1`) {
+		t.Fatalf("status JSON missing expected state counts: %s", out)
 	}
 }
 

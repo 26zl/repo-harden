@@ -341,8 +341,6 @@ func auditGitLabVariables(ctx context.Context, c *restClient, p gitlabProject, s
 	return providerRow("gitlab", "repo", p.PathWithNamespace, "repo-secrets", "CI variables are protected and masked", "medium", StatusCompliant, fmt.Sprintf("%d variables reviewed", total), rem)
 }
 
-// gitlabPaged grabs all pages of a GitLab list endpoint (X-Next-Page header).
-// otherwise we'd only see the first 100 items and report a false "compliant".
 func gitlabPaged[T any](ctx context.Context, c *restClient, path string, extra url.Values) ([]T, error) {
 	var all []T
 	page := 1
@@ -710,8 +708,7 @@ func auditGiteaWorkflows(ctx context.Context, c *restClient, provider string, re
 }
 
 func auditGiteaSecrets(ctx context.Context, c *restClient, provider string, repo giteaRepo) auditRow {
-	var secrets []map[string]any
-	_, err := c.get(ctx, giteaRepoPath(repo, "/actions/secrets"), nil, &secrets)
+	secrets, err := giteaPaged[map[string]any](ctx, c, giteaRepoPath(repo, "/actions/secrets"))
 	if err != nil {
 		if httpUnavailable(err) {
 			return providerRow(provider, "repo", repo.FullName, "repo-secrets", "Action secrets are reviewed", "medium", StatusSkipped, "actions secrets API unavailable", "Review and rotate repository action secrets.")
@@ -721,11 +718,10 @@ func auditGiteaSecrets(ctx context.Context, c *restClient, provider string, repo
 	return providerRow(provider, "repo", repo.FullName, "repo-secrets", "Action secrets are reviewed", "medium", StatusCompliant, fmt.Sprintf("%d action secrets visible", len(secrets)), "Review and rotate repository action secrets.")
 }
 
-// giteaPaged grabs all pages of a Gitea/Forgejo list endpoint, stops on a short page.
 func giteaPaged[T any](ctx context.Context, c *restClient, path string) ([]T, error) {
 	var all []T
 	const limit = 50
-	const maxPages = 1000 // cap against a server that never returns a short page
+	const maxPages = 1000
 	for page := 1; page <= maxPages; page++ {
 		var batch []T
 		_, err := c.get(ctx, path, url.Values{"limit": []string{strconv.Itoa(limit)}, "page": []string{strconv.Itoa(page)}}, &batch)

@@ -30,7 +30,6 @@ const (
 
 const dynamicPrefix = "dynamic/"
 
-// build info, overridden via -ldflags -X main.* by GoReleaser.
 var (
 	Version       = "dev"
 	Commit        = "none"
@@ -179,7 +178,7 @@ func Main() {
 	if err != nil {
 		var ue usageError
 		if errors.As(err, &ue) {
-			dieUsage(ue.err) // bad invocation / failed validation -> exit 2
+			dieUsage(ue.err)
 		}
 		var code exitError
 		if errors.As(err, &code) {
@@ -292,20 +291,15 @@ func die(err error) {
 	os.Exit(1)
 }
 
-// dieUsage is for bad invocation (unknown flag/option), exit 2. die (exit 1) is
-// for operations that ran but failed.
 func dieUsage(err error) {
 	fmt.Fprintln(os.Stderr, "error:", err)
 	os.Exit(2)
 }
 
-// exitError carries a process exit code up to Main without printing a message.
 type exitError int
 
 func (e exitError) Error() string { return "" }
 
-// usageError marks a bad-invocation / failed-validation error so Main routes it
-// through dieUsage (exit 2), keeping it distinct from ran-but-failed (exit 1).
 type usageError struct{ err error }
 
 func (e usageError) Error() string { return e.err.Error() }
@@ -433,7 +427,6 @@ func newClient(o *opts) (*github.Client, error) {
 	return github.NewClient(github.WithHTTPClient(hc), github.WithEnterpriseURLs(apiURL, uploadURL))
 }
 
-// picks the token: --token-stdin, then --token, then gh auth, then env.
 func resolveToken(o *opts, host, provider string) (string, error) {
 	if o.tokenStdin {
 		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
@@ -488,7 +481,6 @@ func providerBaseURL(provider, hostOrURL string) string {
 
 func githubEnterpriseURLs(hostOrURL string) (string, string) {
 	base := strings.TrimRight(providerBaseURL("github", hostOrURL), "/")
-	// accept either the web root or the API url
 	base = strings.TrimSuffix(base, "/api/v3")
 	return base + "/api/v3/", base + "/api/uploads/"
 }
@@ -509,7 +501,6 @@ func skipWorkflow(wf *github.Workflow, o *opts) bool {
 }
 
 func listRepos(ctx context.Context, c *github.Client, o *opts) ([]*github.Repository, error) {
-	// --repo given, so just grab those repos directly
 	if o.repo != "" {
 		repos, err := getNamedRepos(ctx, c, o.repo)
 		if err != nil {
@@ -567,8 +558,6 @@ func repositoryExclusionReason(r *github.Repository, o *opts) string {
 	return ""
 }
 
-// fetches the repos named in a comma-separated owner/repo list. listRepos
-// applies the same owner/fork/archive/admin eligibility policy afterward.
 func getNamedRepos(ctx context.Context, c *github.Client, csv string) ([]*github.Repository, error) {
 	var out []*github.Repository
 	seen := map[string]bool{}
@@ -740,7 +729,6 @@ func cmdDisableAll(ctx context.Context, c *github.Client, o *opts) error {
 		have[entryKey(e.Repo, e.ID)] = true
 	}
 
-	// pass 1: find the active workflows to disable
 	type target struct {
 		owner, name string
 		id          int64
@@ -804,14 +792,11 @@ func cmdDisableAll(ctx context.Context, c *github.Client, o *opts) error {
 		return nil
 	}
 
-	// save state before disabling so a crash mid-run can still be undone with
-	// enable-all. over-recording is fine, enable is a no-op if already enabled.
 	merged := append(existing, added...)
 	if err := saveState(statePath, scope, merged); err != nil {
 		return err
 	}
 
-	// Pass 2: disable.
 	var (
 		mu2      sync.Mutex
 		changed  int

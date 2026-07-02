@@ -16,7 +16,6 @@ func TestRecorderUpdatesPriorOnReharden(t *testing.T) {
 	if _, err := r.record(HardenEntry{Repo: "me/app", Control: "token-readonly", Prior: `{"default_workflow_permissions":"write"}`}); err != nil {
 		t.Fatal(err)
 	}
-	// re-record the same control with a new prior
 	fresh := `{"default_workflow_permissions":"read","can_approve_pull_request_reviews":true}`
 	if _, err := r.record(HardenEntry{Repo: "me/app", Control: "token-readonly", Prior: fresh}); err != nil {
 		t.Fatal(err)
@@ -238,8 +237,6 @@ func TestCollectHardenDryRunAppliesNothing(t *testing.T) {
 	if applied != 0 {
 		t.Fatalf("dry-run applied %d, want 0", applied)
 	}
-	// dry-run never calls Apply, but the returned count reports gaps that WOULD
-	// be hardened so the summary can show it.
 	if appliedCount != 1 {
 		t.Fatalf("dry-run would-harden count %d, want 1 (the gap)", appliedCount)
 	}

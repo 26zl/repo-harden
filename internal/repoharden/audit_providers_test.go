@@ -16,7 +16,7 @@ func TestGitlabPagedFollowsNextPage(t *testing.T) {
 			w.Header().Set("X-Next-Page", "2")
 			_, _ = w.Write([]byte(`[{"id":1},{"id":2}]`))
 		case "2":
-			_, _ = w.Write([]byte(`[{"id":3}]`)) // no X-Next-Page -> last page
+			_, _ = w.Write([]byte(`[{"id":3}]`))
 		default:
 			_, _ = w.Write([]byte(`[]`))
 		}
@@ -46,12 +46,12 @@ func TestGitlabPagedRejectsNonAdvancingPagination(t *testing.T) {
 }
 
 func TestGiteaPagedStopsOnShortPage(t *testing.T) {
-	full := "[" + strings.Repeat(`{"x":1},`, 49) + `{"x":1}]` // exactly 50 items
+	full := "[" + strings.Repeat(`{"x":1},`, 49) + `{"x":1}]`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("page") == "1" {
-			_, _ = w.Write([]byte(full)) // full page -> continue
+			_, _ = w.Write([]byte(full))
 		} else {
-			_, _ = w.Write([]byte(`[{"x":1}]`)) // short page -> stop
+			_, _ = w.Write([]byte(`[{"x":1}]`))
 		}
 	}))
 	defer srv.Close()
@@ -112,11 +112,16 @@ func TestEscapedFilePathKeepsPathSegments(t *testing.T) {
 }
 
 func TestHTTPUnavailableUsesRESTStatusCode(t *testing.T) {
-	if !httpUnavailable(&restError{statusCode: http.StatusNotFound, status: "404 Not Found"}) {
-		t.Fatal("404 rest error should be unavailable")
+	// Permission and tier gates must be skipped instead of reported as audit failures.
+	for _, code := range []int{http.StatusForbidden, http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusGone} {
+		if !httpUnavailable(&restError{statusCode: code}) {
+			t.Fatalf("status %d should be treated as unavailable (→ skip)", code)
+		}
 	}
-	if httpUnavailable(&restError{statusCode: http.StatusForbidden, status: "403 Forbidden"}) {
-		t.Fatal("403 rest error should not be treated as unavailable")
+	for _, code := range []int{http.StatusUnauthorized, http.StatusBadRequest, http.StatusInternalServerError} {
+		if httpUnavailable(&restError{statusCode: code}) {
+			t.Fatalf("status %d should remain a real error, not unavailable", code)
+		}
 	}
 }
 
@@ -134,7 +139,7 @@ func TestAuditGitLabBranchProtectionClassifies(t *testing.T) {
 		want   ControlStatus
 	}{
 		{"protected", http.StatusOK, StatusCompliant},
-		{"unprotected", http.StatusNotFound, StatusGap}, // 404 = unavailable = gap
+		{"unprotected", http.StatusNotFound, StatusGap},
 		{"server-error", http.StatusInternalServerError, StatusError},
 	}
 	for _, tc := range cases {
@@ -166,7 +171,7 @@ func TestCollectGitLabAuditSmoke(t *testing.T) {
 			_, _ = w.Write([]byte(`[{"id":1,"path_with_namespace":"me/app","default_branch":"main","visibility":"private"}]`))
 			return
 		}
-		http.NotFound(w, r) // every per-check endpoint 404s -> gap/skip, must not panic
+		http.NotFound(w, r)
 	}))
 	defer srv.Close()
 	rows, count, err := collectGitLabAudit(context.Background(), &opts{provider: "gitlab", host: srv.URL, token: "t", staleDays: 180})
@@ -260,5 +265,35 @@ func TestGiteaBranchProtectionRequiresDepth(t *testing.T) {
 				t.Fatalf("status=%s detail=%q, want %s", row.Status, row.Detail, tc.want)
 			}
 		})
+	}
+}
+
+func TestAuditGitLabVariablesSkipsOn403(t *testing.T) {
+	// A GitLab permission or tier gate must not lower the audit score.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+	}))
+	defer srv.Close()
+	client := &restClient{baseURL: srv.URL, token: "t", header: "PRIVATE-TOKEN", prefix: "", client: srv.Client()}
+	row := auditGitLabVariables(context.Background(), client, gitlabProject{PathWithNamespace: "me/app"}, false)
+	if row.Status != string(StatusSkipped) {
+		t.Fatalf("status=%s detail=%q, want skipped on 403", row.Status, row.Detail)
+	}
+}
+
+func TestAuditGiteaSecretsPaginates(t *testing.T) {
+	full := "[" + strings.Repeat(`{"name":"S"},`, 49) + `{"name":"S"}]`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("page") == "1" {
+			_, _ = w.Write([]byte(full))
+			return
+		}
+		_, _ = w.Write([]byte(`[{"name":"S"}]`))
+	}))
+	defer srv.Close()
+	client := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", prefix: "token ", client: srv.Client()}
+	row := auditGiteaSecrets(context.Background(), client, "gitea", giteaRepo{FullName: "me/app"})
+	if !strings.Contains(row.Detail, "51 action secrets") {
+		t.Fatalf("detail=%q, want 51 secrets counted across two pages (would be 50 without pagination)", row.Detail)
 	}
 }

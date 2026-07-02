@@ -222,7 +222,7 @@ func saveStateEnvelope[T any](path, kind string, scope StateScope, entries []T) 
 		_ = tmp.Close()
 		return err
 	}
-	if err := tmp.Sync(); err != nil { // flush contents to disk before the rename
+	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		return err
 	}
@@ -232,7 +232,6 @@ func saveStateEnvelope[T any](path, kind string, scope StateScope, entries []T) 
 	if err := os.Rename(tmpName, path); err != nil {
 		return err
 	}
-	// fsync the directory so the rename survives a crash right after it
 	if d, err := os.Open(dir); err == nil { // #nosec G304 -- fsync the selected state file's parent.
 		_ = d.Sync()
 		_ = d.Close()
@@ -342,7 +341,6 @@ func validateHardenEntries(entries []HardenEntry) error {
 	return nil
 }
 
-// stateDir is the dir for both state files.
 func stateDir() (string, error) {
 	dir := strings.TrimSpace(os.Getenv("REPO_HARDEN_STATE_DIR"))
 	managedDefault := dir == ""
@@ -369,9 +367,6 @@ func stateDir() (string, error) {
 	default:
 		return "", err
 	}
-	// ~/.repo-harden is owned by this tool, so keep it private. An explicit
-	// override may be a shared parent chosen by the operator; do not silently
-	// change permissions on an existing external directory.
 	if managedDefault {
 		if err := os.Chmod(dir, 0o700); err != nil { // #nosec G302,G703 -- 0700 is correct for the tool-owned default directory.
 			return "", err

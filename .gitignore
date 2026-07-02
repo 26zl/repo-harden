@@ -16,7 +16,7 @@ harden-state.json
 .idea/
 .vscode/
 
-# Claude Code
+# Local tooling
 .claude/
 CLAUDE.md
 .superpowers/

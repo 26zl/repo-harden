@@ -28,7 +28,6 @@ func TestTruncate(t *testing.T) {
 }
 
 func TestScoreBarWidth(t *testing.T) {
-	// Width is constant regardless of score, and color-free with --no-color.
 	for _, s := range []int{-5, 0, 49, 80, 100, 150} {
 		bar := scoreBar(&opts{noColor: true}, s)
 		if strings.Contains(bar, "\x1b") {

@@ -58,7 +58,7 @@ func collectAudit(ctx context.Context, c *github.Client, o *opts, repos []*githu
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
-	return rows, nil // cmdAudit sorts these
+	return rows, nil
 }
 
 func auditLess(a, b auditRow) bool {
@@ -317,9 +317,7 @@ func auditScoreAvailable(rows []auditRow) bool {
 	return false
 }
 
-// auditVerification reports the severity-weighted share of controls that
-// produced a definite compliant or gap result. Skipped and error rows remain
-// visible as unknown rather than silently inflating confidence in the score.
+// auditVerification reports severity-weighted coverage of definitive audit results.
 func auditVerification(rows []auditRow) int {
 	total := 0
 	verified := 0
@@ -365,8 +363,6 @@ func runAudit(ctx context.Context, c *github.Client, o *opts) ([]auditRow, int, 
 	}
 }
 
-// wantFunc says whether a control should run, based on --only/--skip.
-// we use this to skip the API call, not just filter the output.
 func wantFunc(o *opts) func(string) bool {
 	onlySet := splitSet(o.only)
 	skipSet := splitSet(o.skip)
@@ -431,7 +427,6 @@ func renderAudit(rows []auditRow, repoCount int, o *opts) error {
 
 func renderAuditTable(rows []auditRow, repoCount int, o *opts) {
 	renderAuditSummary(rows, repoCount, o)
-	// group by target, worst score first
 	groups := map[string][]auditRow{}
 	var order []string
 	for _, r := range rows {
@@ -452,7 +447,6 @@ func renderAuditTable(rows []auditRow, repoCount int, o *opts) {
 		grp := groups[target]
 		display := grp
 		if !o.all {
-			// default: just findings, skip clean repos
 			display = actionableRows(grp)
 			if len(display) == 0 {
 				hidden++
@@ -461,7 +455,7 @@ func renderAuditTable(rows []auditRow, repoCount int, o *opts) {
 		}
 		fmt.Printf("\n%s  %s\n",
 			colorize(o, colorCyan, target),
-			colorize(o, colorGray, auditScoreText(grp))) // score uses the whole group
+			colorize(o, colorGray, auditScoreText(grp)))
 		printAuditRows(display, o)
 	}
 	if hidden > 0 {
@@ -471,7 +465,6 @@ func renderAuditTable(rows []auditRow, repoCount int, o *opts) {
 	renderTopRecommendations(rows, o)
 }
 
-// actionableRows just the gap/error rows.
 func actionableRows(rows []auditRow) []auditRow {
 	var out []auditRow
 	for _, r := range rows {
@@ -518,7 +511,6 @@ func printAuditRows(rows []auditRow, o *opts) {
 	}
 }
 
-// score colors: below scoreLow red, below scoreOK yellow, else green.
 const (
 	scoreLow = 50
 	scoreOK  = 80
@@ -616,7 +608,7 @@ func markdownEscape(s string) string {
 
 func auditSARIF(rows []auditRow) map[string]any {
 	rules := map[string]map[string]any{}
-	results := []map[string]any{} // must marshal to [] not null on a clean scan
+	results := []map[string]any{}
 	for _, row := range rows {
 		if row.Status != string(StatusGap) && row.Status != string(StatusError) {
 			continue

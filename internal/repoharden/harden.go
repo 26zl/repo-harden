@@ -29,7 +29,6 @@ func (r *hardenRecorder) count() int {
 	return len(r.entries)
 }
 
-// record stores a pending change before the API mutation starts.
 func (r *hardenRecorder) record(e HardenEntry) (wasNew bool, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -106,12 +105,12 @@ func collectHarden(ctx context.Context, c *github.Client, o *opts, repos []*gith
 		g.Go(func() error {
 			owner, name := splitRepo(r.GetFullName())
 			for _, ctl := range controls {
-				if ctl.Apply == nil { // report-only, skip
+				if ctl.Apply == nil {
 					continue
 				}
 				res := ctl.Detect(gctx, c, owner, name, r)
 				switch res.Status {
-				case StatusCompliant: // already good, nothing to do
+				case StatusCompliant:
 					continue
 				case StatusSkipped:
 					mu.Lock()
@@ -126,7 +125,6 @@ func collectHarden(ctx context.Context, c *github.Client, o *opts, repos []*gith
 					mu.Unlock()
 					continue
 				}
-				// StatusGap
 				hint := ""
 				if res.Prior != "" && !strings.HasPrefix(res.Prior, "{") {
 					hint = "  (was: " + res.Prior + ")"
@@ -134,7 +132,7 @@ func collectHarden(ctx context.Context, c *github.Client, o *opts, repos []*gith
 				mu.Lock()
 				fmt.Printf("%s %s :: %s%s\n", actionLabel(o, "harden"), r.GetFullName(), ctl.Key, hint)
 				if o.dryRun {
-					applied++ // count gaps that would be hardened
+					applied++
 					mu.Unlock()
 					continue
 				}
@@ -246,7 +244,6 @@ func cmdHarden(ctx context.Context, c *github.Client, o *opts) error {
 	return nil
 }
 
-// scopeEntries splits entries into revert/keep by control and repository filters.
 func scopeEntries(entries []HardenEntry, o *opts) (toRevert, kept []HardenEntry, err error) {
 	onlySet := splitSet(o.only)
 	skipSet := splitSet(o.skip)
@@ -284,7 +281,6 @@ func matchesHardenedState(ctl Control, result DetectResult) bool {
 	return result.Status == StatusCompliant
 }
 
-// revertEntries reverts each entry; returns the ones that failed so we can re-save them.
 func revertEntries(ctx context.Context, c *github.Client, o *opts, entries []HardenEntry) []HardenEntry {
 	cm := controlMap()
 	var mu sync.Mutex
@@ -315,7 +311,7 @@ func revertEntries(ctx context.Context, c *github.Client, o *opts, entries []Har
 			}
 			current := ctl.Detect(gctx, c, owner, name, repo)
 			if current.Status == StatusGap && current.Prior == e.Prior {
-				return nil // already restored or the recorded mutation never took effect
+				return nil
 			}
 			if !matchesHardenedState(ctl, current) {
 				mu.Lock()
@@ -338,7 +334,7 @@ func revertEntries(ctx context.Context, c *github.Client, o *opts, entries []Har
 			return nil
 		})
 	}
-	_ = g.Wait() // goroutines never error, failures go in remaining
+	_ = g.Wait()
 
 	return remaining
 }

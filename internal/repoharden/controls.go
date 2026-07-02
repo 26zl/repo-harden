@@ -28,14 +28,14 @@ const (
 	StatusError     ControlStatus = "error"     // detection failed
 )
 
-// DetectResult is what a control reports for one repo. Prior lets Revert put the old value back.
+// DetectResult records a control's status, prior value, and detail for one repository.
 type DetectResult struct {
 	Status ControlStatus
 	Prior  string
 	Detail string
 }
 
-// Control is one baseline check. Apply/Revert are nil for report-only controls.
+// Control defines a baseline check and its optional apply and revert operations.
 type Control struct {
 	Key           string
 	Title         string
@@ -45,15 +45,12 @@ type Control struct {
 	Apply         func(ctx context.Context, c *github.Client, owner, name string) error
 	Revert        func(ctx context.Context, c *github.Client, owner, name, prior string) error
 	ValidatePrior func(prior string) error
-	// MatchesHardened can narrow StatusCompliant when a control accepts multiple
-	// safe configurations but revert must only undo the exact one we applied.
+	// MatchesHardened limits revert to the exact safe configuration applied by this control.
 	MatchesHardened func(result DetectResult) bool
 }
 
-// baseline holds all the controls. the init() blocks below register them.
 var baseline []Control
 
-// selectControls applies --only / --skip (comma-separated keys) to the baseline.
 func selectControls(only, skip string) []Control {
 	onlySet := splitSet(only)
 	skipSet := splitSet(skip)
@@ -109,8 +106,6 @@ func encodePrior(v any) string {
 	return string(b)
 }
 
-// managedRulesetValid checks rs is an active branch ruleset on the default branch
-// with the exact protections harden applies. checks the values, not just that rules exist.
 func managedRulesetValid(rs *github.RepositoryRuleset, branch string) bool {
 	if rs == nil || rs.Rules == nil || rs.Enforcement != github.RulesetEnforcementActive {
 		return false
@@ -154,8 +149,6 @@ func endpointUnavailable(err error) bool {
 	}
 }
 
-// detectErr returns Skipped when the endpoint is just unavailable (no admin access
-// or feature off) instead of a real failure, so collaborator repos stay quiet.
 func detectErr(err error) DetectResult {
 	if endpointUnavailable(err) {
 		return DetectResult{Status: StatusSkipped, Detail: "unavailable (needs admin access, or feature is off)"}
@@ -305,7 +298,7 @@ func init() {
 			return err
 		},
 		Revert: func(ctx context.Context, c *github.Client, owner, name, prior string) error {
-			if prior == "enabled" { // was already on, didn't touch it
+			if prior == "enabled" {
 				return nil
 			}
 			_, err := c.Repositories.DisableVulnerabilityAlerts(ctx, owner, name)
@@ -353,7 +346,7 @@ func init() {
 				if err != nil {
 					return detectErr(err)
 				}
-				if p == nil { // empty 200 body leaves p nil; raw field reads below would panic
+				if p == nil {
 					return DetectResult{Status: StatusError, Detail: "empty workflow-permissions response"}
 				}
 				if p.GetDefaultWorkflowPermissions() == "" || p.CanApprovePullRequestReviews == nil {
@@ -407,7 +400,6 @@ func init() {
 				return DetectResult{Status: StatusSkipped, Detail: "Actions enabled setting is not visible"}
 			}
 			if !p.GetEnabled() {
-				// actions are off for this repo, don't silently turn them on.
 				return DetectResult{Status: StatusSkipped, Detail: "Actions disabled for this repository"}
 			}
 			if p.GetAllowedActions() == "" {
@@ -421,7 +413,7 @@ func init() {
 			if err != nil {
 				return detectErr(err)
 			}
-			if allowed == nil { // empty 200 body; raw field reads below would panic
+			if allowed == nil {
 				return DetectResult{Status: StatusError, Detail: "empty actions-allowed response"}
 			}
 			prior.GithubOwnedAllowed = allowed.GithubOwnedAllowed
@@ -493,14 +485,12 @@ func init() {
 				if err != nil {
 					return detectErr(err)
 				}
-				if full == nil { // can't safely capture/replace a ruleset we couldn't read
+				if full == nil {
 					return DetectResult{Status: StatusError, Detail: "could not read existing ruleset named " + controlRulesetName}
 				}
 				if managedRulesetValid(full, repo.GetDefaultBranch()) {
 					return DetectResult{Status: StatusCompliant}
 				}
-				// there but not a valid managed ruleset (could be the user's own). grab it
-				// so revert can put it back after harden replaces it.
 				return DetectResult{Status: StatusGap, Prior: encodePrior(full), Detail: "ruleset named " + controlRulesetName + " is incomplete or inactive"}
 			}
 			return DetectResult{Status: StatusGap, Detail: "managed ruleset missing"}
@@ -524,8 +514,6 @@ func init() {
 					RequiredLinearHistory: &github.EmptyRuleParameters{},
 				},
 			}
-			// if a same-name ruleset exists, update in place (no delete/create gap),
-			// otherwise create it. detect already grabbed the prior for revert.
 			sets, err := allRepoRulesets(ctx, c, owner, name, false)
 			if err != nil {
 				return fmt.Errorf("confirm existing managed ruleset before mutation: %w", err)
@@ -552,9 +540,8 @@ func init() {
 				}
 			}
 			if id < 0 {
-				return nil // nothing of ours to undo
+				return nil
 			}
-			// if harden replaced an existing same-name ruleset, put it back; else delete ours.
 			if s := strings.TrimSpace(prior); s != "" && s != "null" {
 				var captured github.RepositoryRuleset
 				if err := json.Unmarshal([]byte(prior), &captured); err == nil && captured.Name != "" {
@@ -648,9 +635,6 @@ func init() {
 				if cfg.GetState() == "configured" {
 					return DetectResult{Status: StatusCompliant, Prior: "configured"}
 				}
-				// default setup is off, but an advanced/workflow CodeQL setup might already
-				// scan the default branch. only count it compliant if there's a recent analysis,
-				// since turning on default setup would break a real advanced setup.
 				ref := "refs/heads/" + repo.GetDefaultBranch()
 				analyses, _, aerr := c.CodeScanning.ListAnalysesForRepo(ctx, owner, name,
 					&github.AnalysesListOptions{Ref: github.Ptr(ref), ListOptions: github.ListOptions{PerPage: 1}})
@@ -685,7 +669,6 @@ func init() {
 	)
 }
 
-// fileExists returns true if any of the paths exist. non-404 errors bubble up.
 func fileExists(ctx context.Context, c *github.Client, owner, name string, paths ...string) (bool, error) {
 	for _, p := range paths {
 		file, _, _, err := c.Repositories.GetContents(ctx, owner, name, p, nil)
@@ -769,7 +752,6 @@ func init() {
 	})
 }
 
-// cmdControls lists the baseline controls and whether they're auto-fixable/revertable.
 func cmdControls(o *opts) error {
 	fmt.Println(colorize(o, colorGo, "repo-harden baseline controls"))
 	keyWidth := len("KEY")

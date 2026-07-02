@@ -13,7 +13,7 @@ import (
 func TestAuditSARIF(t *testing.T) {
 	rows := []auditRow{
 		{Control: "secret-scanning", Title: "Secret scanning", Severity: "critical", Status: string(StatusGap), Remediation: "Enable", Repo: "me/app", Detail: "off"},
-		{Control: "ok", Status: string(StatusCompliant), Repo: "me/app"}, // excluded
+		{Control: "ok", Status: string(StatusCompliant), Repo: "me/app"},
 	}
 	b, err := json.Marshal(auditSARIF(rows))
 	if err != nil {
@@ -92,8 +92,6 @@ func TestRenderAuditMarkdownSmoke(t *testing.T) {
 }
 
 func TestRenderAuditTableSmoke(t *testing.T) {
-	// default --format table is what most users see; make sure it renders a mixed
-	// set (incl. empty) without panicking and shows the control.
 	rows := []auditRow{
 		{Control: "secret-scanning", Title: "Secret scanning", Severity: "critical", Status: string(StatusGap), Repo: "me/app", Detail: "off"},
 		{Control: "stale-repo", Severity: "low", Status: string(StatusCompliant), Repo: "me/app"},
@@ -102,7 +100,6 @@ func TestRenderAuditTableSmoke(t *testing.T) {
 	if !strings.Contains(out, "secret-scanning") {
 		t.Fatalf("table output missing control:\n%s", out)
 	}
-	// empty set must not panic
 	_ = captureStdout(t, func() { renderAuditTable(nil, 0, &opts{format: "table", color: "never"}) })
 }
 

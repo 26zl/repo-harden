@@ -177,8 +177,6 @@ func workflowPermissionIssue(content string) string {
 		if issue := permTooBroad(workflow.Permissions); issue != "" {
 			return issue
 		}
-		// Job-level permissions replace the workflow-level default for that job,
-		// so every explicit override still needs to be checked.
 		for _, job := range workflow.Jobs {
 			if job.Permissions == nil {
 				continue

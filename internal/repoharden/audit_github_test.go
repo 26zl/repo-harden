@@ -10,9 +10,6 @@ import (
 	"github.com/google/go-github/v88/github"
 )
 
-// Guards the hardcoded extended-key list in auditControlKeys() against drift:
-// 200 + empty body for every request makes each extended-audit function run and
-// emit its keyed row, and every emitted key must be a known --only/--skip key.
 func TestExtendedAuditControlKeysAreRegistered(t *testing.T) {
 	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: req}, nil
@@ -360,7 +357,6 @@ func TestBranchProtectionMissingDepth(t *testing.T) {
 	if m := branchProtectionMissing(nil, map[string]bool{}); len(m) == 0 {
 		t.Fatal("empty ruleset should report missing protections")
 	}
-	// weak ruleset: has review but lacks status checks / linear history / thread resolution
 	if m := branchProtectionMissing(nil, map[string]bool{"pull_request": true}); len(m) == 0 {
 		t.Fatal("partial ruleset should still report gaps")
 	}
@@ -380,8 +376,8 @@ func TestGlobMatchRefPatterns(t *testing.T) {
 	}{
 		{"refs/heads/main", "refs/heads/main", true},
 		{"refs/heads/*", "refs/heads/main", true},
-		{"refs/heads/*", "refs/heads/a/b", false}, // * does not cross /
-		{"refs/heads/**", "refs/heads/a/b", true}, // ** crosses /
+		{"refs/heads/*", "refs/heads/a/b", false},
+		{"refs/heads/**", "refs/heads/a/b", true},
 		{"refs/heads/release/*", "refs/heads/release/v1", true},
 		{"refs/heads/release/*", "refs/heads/main", false},
 		{"qa/**/x", "qa/a/b/x", true},
@@ -391,5 +387,71 @@ func TestGlobMatchRefPatterns(t *testing.T) {
 		if got := globMatch(c.pattern, c.s); got != c.want {
 			t.Errorf("globMatch(%q,%q)=%v want %v", c.pattern, c.s, got, c.want)
 		}
+	}
+}
+
+func unreadableRulesetsClient(protectionBody string) *github.Client {
+	return mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(req.URL.Path, "/rulesets"):
+			return &http.Response{StatusCode: http.StatusForbidden, Status: "403 Forbidden", Header: make(http.Header), Body: http.NoBody, Request: req}, nil
+		case strings.HasSuffix(req.URL.Path, "/protection"):
+			return jsonResponse(protectionBody), nil
+		}
+		return jsonResponse(`{}`), nil
+	})})
+}
+
+func TestBranchProtectionSkipsWhenRulesetsUnavailable(t *testing.T) {
+	body := `{"enforce_admins":{"enabled":true},"required_status_checks":{"contexts":["ci"]},"required_conversation_resolution":{"enabled":true},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false},"required_linear_history":{"enabled":true}}`
+	client := unreadableRulesetsClient(body)
+	repo := &github.Repository{FullName: github.Ptr("me/app"), DefaultBranch: github.Ptr("main")}
+	row := auditGitHubBranchProtection(context.Background(), client, "me", "app", repo)
+	if row.Status != string(StatusSkipped) {
+		t.Fatalf("status=%s detail=%q, want skipped", row.Status, row.Detail)
+	}
+}
+
+func TestBranchProtectionReportsAdminGapEvenWhenRulesetsUnavailable(t *testing.T) {
+	complete := `{"required_pull_request_reviews":{"required_approving_review_count":1},"required_status_checks":{"contexts":["ci"]},"required_conversation_resolution":{"enabled":true},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false},"required_linear_history":{"enabled":true},"enforce_admins":{"enabled":false}}`
+	client := unreadableRulesetsClient(complete)
+	repo := &github.Repository{FullName: github.Ptr("me/app"), DefaultBranch: github.Ptr("main")}
+	row := auditGitHubBranchProtection(context.Background(), client, "me", "app", repo)
+	if row.Status != string(StatusGap) || !strings.Contains(row.Detail, "admin enforcement") {
+		t.Fatalf("status=%s detail=%q, want gap citing admin enforcement", row.Status, row.Detail)
+	}
+}
+
+func TestSignedCommitsSkipsWhenRulesetsUnavailable(t *testing.T) {
+	client := unreadableRulesetsClient(`{}`)
+	repo := &github.Repository{FullName: github.Ptr("me/app"), DefaultBranch: github.Ptr("main")}
+	row := auditGitHubSignedCommits(context.Background(), client, "me", "app", repo)
+	if row.Status != string(StatusSkipped) {
+		t.Fatalf("status=%s detail=%q, want skipped", row.Status, row.Detail)
+	}
+}
+
+func TestOrgTokenPolicySkipsOnEmptyBody(t *testing.T) {
+	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: req}, nil
+	})})
+	row := auditGitHubOrgTokenPolicy(context.Background(), client, "myorg")
+	if row.Status != string(StatusSkipped) {
+		t.Fatalf("status=%s, want skipped on an empty 200 body (p==nil)", row.Status)
+	}
+}
+
+func TestOpenSecurityAdvisoriesPaginates(t *testing.T) {
+	page1 := "[" + strings.Repeat(`{"ghsa_id":"G","severity":"low"},`, 99) + `{"ghsa_id":"G1","severity":"high"}]`
+	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Query().Get("page") == "1" {
+			return jsonResponse(page1), nil
+		}
+		return jsonResponse(`[{"ghsa_id":"G2","severity":"critical"}]`), nil
+	})})
+	repo := &github.Repository{FullName: github.Ptr("me/app")}
+	row := auditGitHubOpenSecurityAdvisories(context.Background(), client, "me", "app", repo)
+	if row.Status != string(StatusGap) || !strings.Contains(row.Detail, "G2") {
+		t.Fatalf("status=%s detail=%q, want gap including page-2 advisory G2", row.Status, row.Detail)
 	}
 }

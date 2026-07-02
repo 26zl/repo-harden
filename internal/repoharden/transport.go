@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -18,6 +19,21 @@ type authTransport struct {
 func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req = req.Clone(req.Context())
 	req.Header.Set("Authorization", "Bearer "+t.token)
+	return t.base.RoundTrip(req)
+}
+
+// hostScopedHeader prevents custom token headers from crossing host boundaries.
+type hostScopedHeader struct {
+	header string
+	host   string
+	base   http.RoundTripper
+}
+
+func (t *hostScopedHeader) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !strings.EqualFold(req.URL.Host, t.host) {
+		req = req.Clone(req.Context())
+		req.Header.Del(t.header)
+	}
 	return t.base.RoundTrip(req)
 }
 
@@ -78,8 +94,6 @@ func (rt *retryTransport) retryDelay(req *http.Request, resp *http.Response, att
 			}
 		}
 	}
-	// Stable, non-negative jitter prevents a fleet of concurrent workers from
-	// retrying at exactly the same instant without making tests nondeterministic.
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(req.Method + "\x00" + req.URL.String() + "\x00" + strconv.Itoa(attempt)))
 	wait += time.Duration(h.Sum32()%251) * time.Millisecond
@@ -118,7 +132,7 @@ func noCrossHostRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) > 0 && req.URL.Host != via[0].URL.Host {
 		return fmt.Errorf("refusing cross-host redirect to %s", req.URL.Host)
 	}
-	if err := requireSecureURL(req.URL.String()); err != nil {
+	if err := requireSecureRedirectURL(req.URL.String()); err != nil {
 		return err
 	}
 	if len(via) >= 10 {

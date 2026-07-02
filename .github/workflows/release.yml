@@ -8,9 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  # Run the full gate in a low-privilege job first; the privileged release job
-  # below only runs if this passes, so test tooling never executes alongside
-  # id-token:write / contents:write.
+  # Run the full gate before granting release credentials.
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -27,8 +25,11 @@ jobs:
         run: go vet ./...
       - name: build
         run: go build ./...
-      - name: test (race)
-        run: go test -race ./...
+      - name: test (race + coverage)
+        run: |
+          go test -race -coverprofile=coverage.out ./...
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%", "", $3); print $3}')
+          awk -v total="$total" 'BEGIN { if (total < 55.0) { printf "coverage %.1f%% is below 55.0%%\n", total; exit 1 } }'
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.5.0 ./...
       - name: staticcheck

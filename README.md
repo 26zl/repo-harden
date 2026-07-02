@@ -3,7 +3,7 @@
 > **Audit, harden, and manage your repositories — from one static binary.**
 > Read-only security posture across **GitHub, GitLab, Gitea & Forgejo** · reversible GitHub hardening · bulk GitHub Actions control.
 
-[![CI](https://github.com/26zl/repo-harden/actions/workflows/ci.yml/badge.svg)](https://github.com/26zl/repo-harden/actions/workflows/ci.yml) [![Go Report Card](https://goreportcard.com/badge/github.com/26zl/repo-harden)](https://goreportcard.com/report/github.com/26zl/repo-harden) ![Go 1.25+](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/26zl/repo-harden/actions/workflows/ci.yml/badge.svg)](https://github.com/26zl/repo-harden/actions/workflows/ci.yml) [![Go Report Card](https://goreportcard.com/badge/github.com/26zl/repo-harden)](https://goreportcard.com/report/github.com/26zl/repo-harden) ![Go 1.25.11+](https://img.shields.io/badge/Go-1.25.11%2B-00ADD8?logo=go&logoColor=white) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ```text
                        _                _
@@ -17,9 +17,9 @@
 
 Three things, no infrastructure — just a local binary and a token:
 
-- **🔍 Audit (read-only, multi-forge).** Scan your repos against a security baseline and get a posture score. Full catalog on **GitHub** (50+ checks); a portable subset on **GitLab, Gitea, and Forgejo**. Output as table, JSON, Markdown, or SARIF.
-- **🔒 Harden + revert (GitHub).** Apply the free security baseline — branch protection, read-only `GITHUB_TOKEN`, Dependabot, secret/code scanning — across every eligible repo at once. Host- and account-bound state records applied, pending, or ambiguous mutations so `revert` can restore verified changes safely. Forks and archived repos are skipped by default unless you opt in. 8 auto-fixable controls are reversible.
-- **⚙️ Actions management (GitHub).** Bulk enable/disable Actions workflows — per repo or across eligible repos — when you hit free-minute limits, with saved state so you can restore.
+- **Audit (read-only, multi-forge).** Scan your repos against a security baseline and get a posture score. Full catalog on **GitHub** (50+ checks); a portable subset on **GitLab, Gitea, and Forgejo**. Output as table, JSON, Markdown, or SARIF.
+- **Harden + revert (GitHub).** Apply the free security baseline — branch protection, read-only `GITHUB_TOKEN`, Dependabot, secret/code scanning — across every eligible repo at once. Host- and account-bound state records applied, pending, or ambiguous mutations so `revert` can restore verified changes safely. Forks and archived repos are skipped by default unless you opt in. 8 auto-fixable controls are reversible.
+- **Actions management (GitHub).** Bulk enable/disable Actions workflows — per repo or across eligible repos — when you hit free-minute limits, with saved state so you can restore.
 
 No GitHub App, no org-admin config repo, no Terraform, no standing access.
 
@@ -53,6 +53,7 @@ repo-harden revert
 | `harden` | Apply the auto-fixable baseline controls (8 of them) and save revert state first. GitHub only. `--dry-run`, `--only`/`--skip`. |
 | `revert` | Restore verified changes from host/account-bound recovery state. GitHub only. |
 | `controls` | List every baseline control and whether it is auto-fixable and reversible. Offline, no token. |
+| `version` / `help` | Print version and build info / show usage. Offline, no token. |
 
 **GitHub Actions management**
 
@@ -105,7 +106,7 @@ $REPO_HARDEN_STATE_DIR/harden-state.json   # if REPO_HARDEN_STATE_DIR is set
 
 `revert` reads this file and restores changes that were recorded as applied. It re-detects every live setting first, including entries marked `applied`, and refuses to overwrite settings that have drifted since `harden`. If an API call fails ambiguously, the entry remains `pending`/`unknown`; controls that were already compliant are never recorded.
 
-State files are versioned and bound to the GitHub host and authenticated account. A state file created for GHES cannot be replayed against GitHub.com or by a different account. Legacy array-only state from pre-release builds is rejected because it has no trustworthy host binding; move it aside and run the originating command again.
+State files are versioned and bound to the GitHub host and authenticated account, so unbound legacy files and cross-host or cross-account replays are rejected.
 
 Actions bulk-disable uses a separate state file:
 
@@ -129,7 +130,7 @@ repo-harden audit --format sarif > out.sarif  # for GitHub code-scanning ingesti
 | Flag | Description |
 | --- | --- |
 | `--provider <name>` | `github` (default), `gitlab`, `gitea`, `forgejo` (audit) |
-| `--host <host-or-url>` | Provider host (GHES, GitLab, Gitea/Forgejo); accepts the web root or the API URL |
+| `--host <host-or-url>` | Provider host (GHES, GitLab, Gitea/Forgejo); accepts the web root or the API URL. Gitea/Forgejo default to `http://localhost:3000` |
 | `--token <token>` | Provider token (discouraged — visible in `ps`/shell history; prefer env vars, `gh auth`, or `--token-stdin`) |
 | `--token-stdin` | Read the provider token from stdin |
 | `--dry-run` | Perform read-only detection and print intended mutations; API read calls still occur |
@@ -153,7 +154,7 @@ repo-harden audit --format sarif > out.sarif  # for GitHub code-scanning ingesti
 
 ## Requirements & install
 
-- Go 1.25+
+- Go 1.25.11+ (the `go.mod` toolchain pin; with the default `GOTOOLCHAIN=auto` the right toolchain is fetched automatically)
 - A token for the forge you target: [`gh`](https://cli.github.com/) logged in (`gh auth login`) or `GITHUB_TOKEN`; `GITLAB_TOKEN` / `GITEA_TOKEN` / `FORGEJO_TOKEN` for those providers
 
 Use the least-privilege token that covers the commands you run:

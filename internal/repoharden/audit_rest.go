@@ -43,6 +43,10 @@ func newRestClient(provider string, o *opts) (*restClient, error) {
 	if err := requireSecureURL(base); err != nil {
 		return nil, err
 	}
+	baseURL, err := url.Parse(base)
+	if err != nil {
+		return nil, err
+	}
 	return &restClient{
 		baseURL: base,
 		token:   token,
@@ -51,7 +55,10 @@ func newRestClient(provider string, o *opts) (*restClient, error) {
 		client: &http.Client{
 			Timeout:       30 * time.Second,
 			CheckRedirect: noCrossHostRedirect,
-			Transport:     &retryTransport{base: http.DefaultTransport, max: 3},
+			Transport: &retryTransport{
+				base: &hostScopedHeader{header: header, host: baseURL.Host, base: http.DefaultTransport},
+				max:  3,
+			},
 		},
 	}, nil
 }
@@ -120,7 +127,7 @@ func httpUnavailable(err error) bool {
 	var restErr *restError
 	if errors.As(err, &restErr) {
 		switch restErr.statusCode {
-		case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusGone:
+		case http.StatusForbidden, http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusGone:
 			return true
 		}
 	}
@@ -132,6 +139,22 @@ func requireSecureURL(raw string) error {
 	if err != nil {
 		return err
 	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return errors.New("URL must not contain a query or fragment")
+	}
+	return checkSecureURL(u)
+}
+
+// requireSecureRedirectURL validates redirect targets while allowing query strings and fragments.
+func requireSecureRedirectURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	return checkSecureURL(u)
+}
+
+func checkSecureURL(u *url.URL) error {
 	if u.Scheme != "https" && u.Scheme != "http" {
 		return fmt.Errorf("unsupported URL scheme %q (expected https or loopback http)", u.Scheme)
 	}
@@ -140,9 +163,6 @@ func requireSecureURL(raw string) error {
 	}
 	if u.User != nil {
 		return errors.New("URL must not contain user information")
-	}
-	if u.RawQuery != "" || u.Fragment != "" {
-		return errors.New("URL must not contain a query or fragment")
 	}
 	if u.Scheme == "http" {
 		switch u.Hostname() {

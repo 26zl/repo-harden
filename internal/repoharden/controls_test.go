@@ -11,7 +11,6 @@ import (
 	"github.com/google/go-github/v88/github"
 )
 
-// mockClient builds a github.Client whose transport routes by "METHOD path".
 func mockClient(routes map[string]string) *github.Client {
 	return mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		key := req.Method + " " + req.URL.Path
@@ -35,7 +34,6 @@ func controlByKey(t *testing.T, key string) Control {
 }
 
 func TestDetectSkipsOnNoAdminAccess(t *testing.T) {
-	// 403 = collaborator without admin -> skipped, not a noisy error
 	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusForbidden, Header: make(http.Header), Body: http.NoBody, Request: req}, nil
 	})})
@@ -71,7 +69,6 @@ func TestDependabotAlertsDetect(t *testing.T) {
 	ctl := controlByKey(t, "dependabot-alerts")
 
 	on := mockClient(map[string]string{"GET /repos/me/app/vulnerability-alerts": ``})
-	// matched route (200) => enabled; unmatched (404) => disabled
 	if got := ctl.Detect(context.Background(), on, "me", "app", &github.Repository{}); got.Status != StatusCompliant {
 		t.Fatalf("enabled repo: got %s, want compliant", got.Status)
 	}
@@ -194,7 +191,6 @@ func TestControlsOutputKeepsLongKeysSeparated(t *testing.T) {
 
 func TestCodeScanningCompliantViaAdvancedSetup(t *testing.T) {
 	ctl := controlByKey(t, "code-scanning")
-	// recent analysis -> compliant (future date keeps this deterministic)
 	recent := mockClient(map[string]string{
 		"GET /repos/me/app/code-scanning/default-setup": `{"state":"not-configured"}`,
 		"GET /repos/me/app/code-scanning/analyses":      `[{"id":1,"created_at":"2999-01-01T00:00:00Z"}]`,
@@ -202,7 +198,6 @@ func TestCodeScanningCompliantViaAdvancedSetup(t *testing.T) {
 	if got := ctl.Detect(context.Background(), recent, "me", "app", &github.Repository{}); got.Status != StatusCompliant {
 		t.Fatalf("recent analysis: got %s (%s), want compliant", got.Status, got.Detail)
 	}
-	// stale analysis -> gap (one old analysis does not prove scanning still runs)
 	stale := mockClient(map[string]string{
 		"GET /repos/me/app/code-scanning/default-setup": `{"state":"not-configured"}`,
 		"GET /repos/me/app/code-scanning/analyses":      `[{"id":1,"created_at":"2020-01-01T00:00:00Z"}]`,
@@ -245,7 +240,6 @@ func TestBranchProtectionDetect(t *testing.T) {
 	if got := ctl.Detect(context.Background(), has, "me", "app", repo); got.Status != StatusCompliant {
 		t.Fatalf("valid ruleset: got %s (%s), want compliant", got.Status, got.Detail)
 	}
-	// active but weak (no thread resolution) -> not compliant
 	weak := mockClient(map[string]string{
 		"GET /repos/me/app/rulesets":   `[{"id":8,"name":"repo-harden","enforcement":"active","target":"branch"}]`,
 		"GET /repos/me/app/rulesets/8": `{"id":8,"name":"repo-harden","enforcement":"active","target":"branch","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"pull_request","parameters":{"required_approving_review_count":0}},{"type":"non_fast_forward"},{"type":"required_linear_history"}]}`,
@@ -257,7 +251,6 @@ func TestBranchProtectionDetect(t *testing.T) {
 	if got := ctl.Detect(context.Background(), none, "me", "app", repo); got.Status != StatusGap {
 		t.Fatalf("no ruleset: got %s, want gap", got.Status)
 	}
-	// present but inactive -> gap, not falsely compliant, AND capture it so revert can restore
 	inactive := mockClient(map[string]string{
 		"GET /repos/me/app/rulesets":   `[{"id":7,"name":"repo-harden","enforcement":"disabled","target":"branch"}]`,
 		"GET /repos/me/app/rulesets/7": `{"id":7,"name":"repo-harden","enforcement":"disabled","target":"branch","rules":[{"type":"pull_request","parameters":{"required_approving_review_count":1}}]}`,
@@ -299,7 +292,7 @@ func TestBranchProtectionApplyUpdatesExistingInPlace(t *testing.T) {
 		case req.Method == http.MethodGet && req.URL.Path == "/repos/me/app/rulesets":
 			return jsonResponse(`[{"id":7,"name":"repo-harden"}]`), nil
 		case req.URL.Path == "/repos/me/app/rulesets/7", req.URL.Path == "/repos/me/app/rulesets":
-			method, path = req.Method, req.URL.Path // capture the mutating call (PUT update vs POST create)
+			method, path = req.Method, req.URL.Path
 			return jsonResponse(`{"id":7,"name":"repo-harden"}`), nil
 		}
 		return &http.Response{StatusCode: 404, Header: make(http.Header), Body: http.NoBody}, nil
@@ -447,17 +440,14 @@ func TestSecretScanningRevertRestoresDisabled(t *testing.T) {
 }
 
 func TestParseSecretScanningPriorRoundTrip(t *testing.T) {
-	// what Detect encodes must decode back to the same values
 	in := secretScanningPrior{SecretScanning: "enabled", PushProtection: "disabled"}
 	got := parseSecretScanningPrior(encodePrior(in))
 	if got != in {
 		t.Fatalf("round-trip = %+v, want %+v", got, in)
 	}
-	// legacy "enabled" string -> both enabled
 	if p := parseSecretScanningPrior("enabled"); p.SecretScanning != "enabled" || p.PushProtection != "enabled" {
 		t.Fatalf("legacy enabled = %+v", p)
 	}
-	// empty/unknown -> disabled (safe default)
 	if p := parseSecretScanningPrior(""); p.SecretScanning != "disabled" || p.PushProtection != "disabled" {
 		t.Fatalf("empty prior = %+v, want disabled", p)
 	}
@@ -474,7 +464,7 @@ func TestSecurityMdDetect(t *testing.T) {
 	if got := ctl.Detect(context.Background(), present, "me", "app", nil); got.Status != StatusCompliant {
 		t.Fatalf("present: got %s, want compliant", got.Status)
 	}
-	absent := mockClient(nil) // all 404
+	absent := mockClient(nil)
 	if got := ctl.Detect(context.Background(), absent, "me", "app", nil); got.Status != StatusGap {
 		t.Fatalf("absent: got %s, want gap", got.Status)
 	}

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -98,6 +99,9 @@ func TestStateFileLockRejectsConcurrentWriter(t *testing.T) {
 }
 
 func TestStateDirDoesNotChmodExistingOverride(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix directory permissions are not meaningful on Windows")
+	}
 	dir := filepath.Join(t.TempDir(), "shared-state")
 	if err := os.Mkdir(dir, 0o755); err != nil {
 		t.Fatal(err)

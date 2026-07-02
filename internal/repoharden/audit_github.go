@@ -15,7 +15,6 @@ import (
 )
 
 func collectGitHubExtendedAudit(ctx context.Context, c *github.Client, o *opts, repos []*github.Repository) ([]auditRow, error) {
-	// gate each check by --only/--skip before the API call so we skip the work, not just the row
 	want := wantFunc(o)
 	var rows []auditRow
 	var mu sync.Mutex
@@ -30,14 +29,14 @@ func collectGitHubExtendedAudit(ctx context.Context, c *github.Client, o *opts, 
 		rows = append(rows, auditGitHubOrganizations(ctx, c, repos, want, o.showIdentifiers)...)
 	}
 	limit := o.concurrency
-	if limit < 1 { // a direct caller (or test) may leave concurrency 0; SetLimit(0) would deadlock
+	if limit < 1 {
 		limit = 1
 	}
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(limit)
 	for _, repo := range repos {
 		g.Go(func() error {
-			ctx := gctx // honor --concurrency and cancellation across the per-repo checks
+			ctx := gctx
 			owner, name := splitRepo(repo.GetFullName())
 			checks := []struct {
 				key string
@@ -111,7 +110,6 @@ func githubAuditRow(repo *github.Repository, key, title, severity string, status
 	}
 }
 
-// returns a Skipped row if the endpoint is just unavailable (no admin access or feature off), else Error.
 func githubAuditErr(repo *github.Repository, key, title, severity string, err error, remediation string) auditRow {
 	if endpointUnavailable(err) {
 		return githubAuditRow(repo, key, title, severity, StatusSkipped, "unavailable (needs admin access, or feature is off)", remediation)
@@ -214,7 +212,6 @@ func auditGitHubBranchProtection(ctx context.Context, c *github.Client, owner, n
 				}
 				return githubAuditRow(repo, "branch-protection-full", "Default branch protection is complete", "high", StatusError, rulesErr.Error(), "Protect the default branch with PR reviews, status checks, admin enforcement, signed commits, and no force pushes.")
 			}
-			// rulesErr is nil here (handled above)
 			missing := branchProtectionMissing(nil, rules)
 			if len(missing) == 0 {
 				return githubAuditRow(repo, "branch-protection-full", "Default branch protection is complete", "high", StatusCompliant, "active rulesets enforce core default-branch safeguards", "Protect the default branch with PR reviews, status checks, admin enforcement, signed commits, and no force pushes.")
@@ -228,6 +225,15 @@ func auditGitHubBranchProtection(ctx context.Context, c *github.Client, owner, n
 		return githubAuditRow(repo, "branch-protection-full", "Default branch protection is complete", "high", StatusError, err.Error(), "Protect the default branch with PR reviews, status checks, admin enforcement, signed commits, and no force pushes.")
 	}
 	missing := branchProtectionMissing(p, rules)
+	if len(missing) > 0 && rulesErr != nil {
+		if definite := branchProtectionMissing(p, allRuleTypes); len(definite) > 0 {
+			return githubAuditRow(repo, "branch-protection-full", "Default branch protection is complete", "high", StatusGap, "missing: "+strings.Join(definite, ", "), "Protect the default branch with PR reviews, status checks, admin enforcement, signed commits, and no force pushes.")
+		}
+		if endpointUnavailable(rulesErr) {
+			return githubAuditRow(repo, "branch-protection-full", "Default branch protection is complete", "high", StatusSkipped, "branch protection present but rulesets unavailable", "Protect the default branch with PR reviews, status checks, admin enforcement, signed commits, and no force pushes.")
+		}
+		return githubAuditRow(repo, "branch-protection-full", "Default branch protection is complete", "high", StatusError, rulesErr.Error(), "Protect the default branch with PR reviews, status checks, admin enforcement, signed commits, and no force pushes.")
+	}
 	if len(missing) > 0 {
 		return githubAuditRow(repo, "branch-protection-full", "Default branch protection is complete", "high", StatusGap, "missing: "+strings.Join(missing, ", "), "Protect the default branch with PR reviews, status checks, admin enforcement, signed commits, and no force pushes.")
 	}
@@ -259,8 +265,14 @@ func auditGitHubSignedCommits(ctx context.Context, c *github.Client, owner, name
 	if p != nil && p.RequiredSignatures != nil && p.RequiredSignatures.GetEnabled() {
 		return githubAuditRow(repo, "signed-commits", "Signed commits required on default branch", "medium", StatusCompliant, "required signatures enabled", "Require signed commits through branch protection or rulesets.")
 	}
-	rules, err := githubActiveRuleTypes(ctx, c, owner, name, branch)
-	if err == nil && rules["required_signatures"] {
+	rules, ruleErr := githubActiveRuleTypes(ctx, c, owner, name, branch)
+	if ruleErr != nil {
+		if endpointUnavailable(ruleErr) {
+			return githubAuditRow(repo, "signed-commits", "Signed commits required on default branch", "medium", StatusSkipped, "signatures absent from branch protection and rulesets unavailable", "Require signed commits through branch protection or rulesets.")
+		}
+		return githubAuditRow(repo, "signed-commits", "Signed commits required on default branch", "medium", StatusError, ruleErr.Error(), "Require signed commits through branch protection or rulesets.")
+	}
+	if rules["required_signatures"] {
 		return githubAuditRow(repo, "signed-commits", "Signed commits required on default branch", "medium", StatusCompliant, "required signatures enforced by ruleset", "Require signed commits through branch protection or rulesets.")
 	}
 	return githubAuditRow(repo, "signed-commits", "Signed commits required on default branch", "medium", StatusGap, "signed commits not required", "Require signed commits through branch protection or rulesets.")
@@ -283,11 +295,6 @@ func auditGitHubRequiredWorkflows(ctx context.Context, c *github.Client, owner, 
 	return githubAuditRow(repo, "required-workflows", "Required workflows are enforced", "medium", StatusGap, "no required workflow rule found", "Use organization or repository rulesets to require critical workflows.")
 }
 
-// returns the rule types active rulesets enforce on the branch.
-// the list endpoint drops rules/conditions, so we fetch each ruleset's detail and
-// only count ones whose ref conditions actually cover this branch.
-// allRepoRulesets pages through every repository ruleset; GetAllRulesets returns
-// only the first page, so rulesets past page 1 (>30) would otherwise be missed.
 func allRepoRulesets(ctx context.Context, c *github.Client, owner, name string, includeParents bool) ([]*github.RepositoryRuleset, error) {
 	opts := &github.RepositoryListRulesetsOptions{ListOptions: github.ListOptions{PerPage: 100}}
 	if includeParents {
@@ -319,7 +326,7 @@ func githubActiveRuleTypes(ctx context.Context, c *github.Client, owner, name, b
 			continue
 		}
 		if t := summary.GetTarget(); t == nil || *t != github.RulesetTargetBranch {
-			continue // only branch rulesets protect a branch
+			continue
 		}
 		full, _, err := c.Repositories.GetRuleset(ctx, owner, name, summary.GetID(), true)
 		if err != nil {
@@ -360,10 +367,9 @@ func githubActiveRuleTypes(ctx context.Context, c *github.Client, owner, name, b
 	return rules, nil
 }
 
-// does the ruleset's ref conditions cover this branch?
 func rulesetTargetsBranch(rs *github.RepositoryRuleset, branch string) bool {
 	if rs.Conditions == nil || rs.Conditions.RefName == nil {
-		return true // no ref condition, so applies to all refs
+		return true
 	}
 	ref := "refs/heads/" + branch
 	cond := rs.Conditions.RefName
@@ -385,7 +391,6 @@ func rulesetTargetsBranch(rs *github.RepositoryRuleset, branch string) bool {
 	return true
 }
 
-// matches a GitHub ruleset ref pattern against a branch ref.
 func refPatternMatches(pattern, ref, branch string) bool {
 	switch pattern {
 	case "~ALL":
@@ -444,8 +449,6 @@ func branchProtectionMissing(p *github.Protection, rules map[string]bool) []stri
 	if p != nil && (p.EnforceAdmins == nil || !p.EnforceAdmins.Enabled) {
 		missing = append(missing, "admin enforcement")
 	}
-	// a ruleset can satisfy these too, so it's only missing when both legacy
-	// protection and the ruleset lack it (same as the review/status checks above).
 	if (p == nil || p.RequiredConversationResolution == nil || !p.RequiredConversationResolution.Enabled) && !rules["thread_resolution"] {
 		missing = append(missing, "conversation resolution")
 	}
@@ -461,6 +464,16 @@ func branchProtectionMissing(p *github.Protection, rules map[string]bool) []stri
 	return missing
 }
 
+// allRuleTypes marks every ruleset-enforceable protection as present, isolating classic-only gaps.
+var allRuleTypes = map[string]bool{
+	"pull_request":            true,
+	"required_status_checks":  true,
+	"thread_resolution":       true,
+	"non_fast_forward":        true,
+	"deletion":                true,
+	"required_linear_history": true,
+}
+
 func auditGitHubForkPRPolicy(ctx context.Context, c *github.Client, owner, name string, repo *github.Repository) auditRow {
 	var out struct {
 		ApprovalPolicy string `json:"approval_policy"`
@@ -472,8 +485,6 @@ func auditGitHubForkPRPolicy(ctx context.Context, c *github.Client, owner, name 
 		return githubAuditRow(repo, "actions-fork-pr-permissions", "Fork PR approval policy is restrictive", "medium", StatusError, err.Error(), "Require approval before running workflows from fork pull requests.")
 	}
 	switch out.ApprovalPolicy {
-	// all_external_contributors is the strictest policy (approval for every external
-	// contributor), so it must count as compliant, not a gap.
 	case "first_time_contributors_new_to_github", "first_time_contributors", "all_external_contributors":
 		return githubAuditRow(repo, "actions-fork-pr-permissions", "Fork PR approval policy is restrictive", "medium", StatusCompliant, "approval policy: "+out.ApprovalPolicy, "Require approval before running workflows from fork pull requests.")
 	default:
@@ -496,7 +507,7 @@ func auditGitHubEnvironments(ctx context.Context, c *github.Client, owner, name 
 	for _, env := range envs {
 		name := strings.ToLower(env.GetName())
 		prodLike := strings.Contains(name, "prod") || strings.Contains(name, "stage") || strings.Contains(name, "deploy")
-		protected := len(env.ProtectionRules) > 0 || len(env.Reviewers) > 0 || env.DeploymentBranchPolicy != nil || env.GetWaitTimer() > 0
+		protected := len(env.ProtectionRules) > 0 || env.DeploymentBranchPolicy != nil
 		if prodLike && !protected {
 			weak = append(weak, env.GetName())
 		}
@@ -681,8 +692,6 @@ type githubPackageListResult struct {
 	err           error
 }
 
-// githubPackageCache memoizes per-owner package listings; safe for the parallel
-// per-repo audit loop.
 type githubPackageCache struct {
 	mu sync.Mutex
 	m  map[string]*githubPackageCacheEntry
@@ -1003,7 +1012,7 @@ func auditGitHubRulesetBypass(ctx context.Context, c *github.Client, owner, name
 		}
 		full, _, err := c.Repositories.GetRuleset(ctx, owner, name, rs.GetID(), true)
 		if err != nil || full == nil {
-			unresolved++ // can't check bypass state, so don't call it compliant
+			unresolved++
 			continue
 		}
 		if len(full.BypassActors) > 0 {
@@ -1079,7 +1088,6 @@ func auditGitHubOrgActionsPolicy(ctx context.Context, c *github.Client, org stri
 			issues = append(issues, "allowlist includes custom patterns")
 		}
 	case "local_only":
-		// Local actions only is stricter than this baseline.
 	default:
 		return githubOrgAuditRow(org, "org-actions-policy", "Organization Actions policy is restricted", "high", StatusError, "unknown allowed_actions value: "+p.GetAllowedActions(), rem)
 	}
@@ -1104,6 +1112,9 @@ func auditGitHubOrgTokenPolicy(ctx context.Context, c *github.Client, org string
 	p, _, err := c.Actions.GetDefaultWorkflowPermissionsInOrganization(ctx, org)
 	if err != nil {
 		return githubOrgAuditErr(org, "org-token-policy", "Organization default GITHUB_TOKEN is read-only", "high", err, "Set organization default workflow token permissions to read and prevent PR approval.")
+	}
+	if p == nil {
+		return githubOrgAuditRow(org, "org-token-policy", "Organization default GITHUB_TOKEN is read-only", "high", StatusSkipped, "organization workflow token policy is not visible", "Set organization default workflow token permissions to read and prevent PR approval.")
 	}
 	if p.GetDefaultWorkflowPermissions() == "read" && !p.GetCanApprovePullRequestReviews() {
 		return githubOrgAuditRow(org, "org-token-policy", "Organization default GITHUB_TOKEN is read-only", "high", StatusCompliant, "default token is read-only", "Set organization default workflow token permissions to read and prevent PR approval.")
@@ -1175,15 +1186,26 @@ func auditGitHubOpenSecurityAdvisories(ctx context.Context, c *github.Client, ow
 		title = "No unresolved repository security advisories"
 		rem   = "Triage and resolve open repository security advisories (Security tab → Advisories)."
 	)
-	var advisories []struct {
+	type triageAdvisory struct {
 		GHSAID   string `json:"ghsa_id"`
 		Severity string `json:"severity"`
 	}
-	if err := githubRawGet(ctx, c, fmt.Sprintf("repos/%s/%s/security-advisories?per_page=100&state=triage", owner, name), &advisories); err != nil {
-		if endpointUnavailable(err) {
-			return githubAuditRow(repo, key, title, "high", StatusSkipped, "security advisories API unavailable", rem)
+	const perPage = 100
+	const maxPages = 20
+	var advisories []triageAdvisory
+	for page := 1; page <= maxPages; page++ {
+		var batch []triageAdvisory
+		path := fmt.Sprintf("repos/%s/%s/security-advisories?per_page=%d&state=triage&page=%d", owner, name, perPage, page)
+		if err := githubRawGet(ctx, c, path, &batch); err != nil {
+			if endpointUnavailable(err) {
+				return githubAuditRow(repo, key, title, "high", StatusSkipped, "security advisories API unavailable", rem)
+			}
+			return githubAuditRow(repo, key, title, "high", StatusError, err.Error(), rem)
 		}
-		return githubAuditRow(repo, key, title, "high", StatusError, err.Error(), rem)
+		advisories = append(advisories, batch...)
+		if len(batch) < perPage {
+			break
+		}
 	}
 	var urgent []string
 	for _, a := range advisories {
@@ -1271,8 +1293,6 @@ func auditGitHubCommunityHealth(ctx context.Context, c *github.Client, owner, na
 	if m == nil || m.Files == nil {
 		return githubAuditRow(repo, key, title, "low", StatusSkipped, "community profile not available", rem)
 	}
-	// GitHub counts issue forms toward a complete profile but may omit them
-	// from files.issue_template in the Community Profile API response.
 	if m.GetHealthPercentage() == 100 {
 		return githubAuditRow(repo, key, title, "low", StatusCompliant, "community health 100%", rem)
 	}
@@ -1348,7 +1368,6 @@ func auditGitHubMergeMethods(repo *github.Repository) auditRow {
 		title = "At least one pull-request merge method is enabled"
 		rem   = "Enable at least one of merge commit, squash, or rebase so pull requests can be merged."
 	)
-	// nil means the field wasn't returned, so don't false-flag
 	if repo.AllowMergeCommit == nil || repo.AllowSquashMerge == nil || repo.AllowRebaseMerge == nil {
 		return githubAuditRow(repo, key, title, "medium", StatusSkipped, "merge-method settings not visible", rem)
 	}
@@ -1424,7 +1443,6 @@ func auditGitHubOrgOutsideCollaborators(ctx context.Context, c *github.Client, o
 	return githubOrgAuditRow(org, key, title, "medium", StatusCompliant, "no outside collaborators", rem)
 }
 
-// max items a detail string lists before "+N more".
 const maxDetailItems = 5
 
 func limitStrings(in []string, n int) []string {
