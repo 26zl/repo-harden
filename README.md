@@ -3,7 +3,7 @@
 > **Audit, harden, and manage your repositories — from one static binary.**
 > Read-only security posture across **GitHub, GitLab, Gitea & Forgejo** · reversible GitHub hardening · bulk GitHub Actions control.
 
-[![CI](https://github.com/26zl/repo-harden/actions/workflows/ci.yml/badge.svg)](https://github.com/26zl/repo-harden/actions/workflows/ci.yml) [![Go Report Card](https://goreportcard.com/badge/github.com/26zl/repo-harden)](https://goreportcard.com/report/github.com/26zl/repo-harden) ![Go 1.25.11+](https://img.shields.io/badge/Go-1.25.11%2B-00ADD8?logo=go&logoColor=white) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/26zl/repo-harden/actions/workflows/ci.yml/badge.svg)](https://github.com/26zl/repo-harden/actions/workflows/ci.yml) [![Go Reference](https://pkg.go.dev/badge/github.com/26zl/repo-harden.svg)](https://pkg.go.dev/github.com/26zl/repo-harden) ![Go 1.25.11+](https://img.shields.io/badge/Go-1.25.11%2B-00ADD8?logo=go&logoColor=white) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ```text
                        _                _
