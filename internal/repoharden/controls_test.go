@@ -124,7 +124,7 @@ func TestDependabotFixesDetect(t *testing.T) {
 func TestActionsAllowlistDetect(t *testing.T) {
 	ctl := controlByKey(t, "actions-allowlist")
 	selected := mockClient(map[string]string{
-		"GET /repos/me/app/actions/permissions":                  `{"enabled":true,"allowed_actions":"selected"}`,
+		"GET /repos/me/app/actions/permissions":                  `{"enabled":true,"allowed_actions":"selected","sha_pinning_required":true}`,
 		"GET /repos/me/app/actions/permissions/selected-actions": `{"github_owned_allowed":true,"verified_allowed":true}`,
 	})
 	if got := ctl.Detect(context.Background(), selected, "me", "app", nil); got.Status != StatusCompliant {
@@ -158,11 +158,52 @@ func TestActionsAllowlistDisabledAndPatterns(t *testing.T) {
 		t.Fatalf("disabled actions: got %s, want skipped", got.Status)
 	}
 	patterns := mockClient(map[string]string{
-		"GET /repos/me/app/actions/permissions":                  `{"enabled":true,"allowed_actions":"selected"}`,
+		"GET /repos/me/app/actions/permissions":                  `{"enabled":true,"allowed_actions":"selected","sha_pinning_required":true}`,
 		"GET /repos/me/app/actions/permissions/selected-actions": `{"github_owned_allowed":true,"verified_allowed":true,"patterns_allowed":["my-org/*"]}`,
 	})
 	if got := ctl.Detect(context.Background(), patterns, "me", "app", nil); got.Status != StatusGap {
-		t.Fatalf("extra patterns: got %s, want gap", got.Status)
+		t.Fatalf("broad patterns: got %s, want gap", got.Status)
+	}
+	narrow := mockClient(map[string]string{
+		"GET /repos/me/app/actions/permissions":                  `{"enabled":true,"allowed_actions":"selected","sha_pinning_required":true}`,
+		"GET /repos/me/app/actions/permissions/selected-actions": `{"github_owned_allowed":true,"verified_allowed":false,"patterns_allowed":["hashicorp/setup-terraform@*","goreleaser/goreleaser-action@*"]}`,
+	})
+	if got := ctl.Detect(context.Background(), narrow, "me", "app", nil); got.Status != StatusCompliant {
+		t.Fatalf("explicit patterns with SHA enforcement: got %s detail=%q, want compliant", got.Status, got.Detail)
+	}
+	noPin := mockClient(map[string]string{
+		"GET /repos/me/app/actions/permissions":                  `{"enabled":true,"allowed_actions":"selected","sha_pinning_required":false}`,
+		"GET /repos/me/app/actions/permissions/selected-actions": `{"github_owned_allowed":true,"verified_allowed":false,"patterns_allowed":["hashicorp/setup-terraform@*"]}`,
+	})
+	if got := ctl.Detect(context.Background(), noPin, "me", "app", nil); got.Status != StatusGap {
+		t.Fatalf("explicit patterns without SHA enforcement: got %s, want gap", got.Status)
+	}
+	unknownPin := mockClient(map[string]string{
+		"GET /repos/me/app/actions/permissions":                  `{"enabled":true,"allowed_actions":"selected"}`,
+		"GET /repos/me/app/actions/permissions/selected-actions": `{"github_owned_allowed":true,"verified_allowed":true}`,
+	})
+	if got := ctl.Detect(context.Background(), unknownPin, "me", "app", nil); got.Status != StatusSkipped {
+		t.Fatalf("unreported SHA enforcement: got %s, want skipped", got.Status)
+	}
+}
+
+func TestExplicitActionPatterns(t *testing.T) {
+	for _, tc := range []struct {
+		patterns []string
+		want     bool
+	}{
+		{nil, true},
+		{[]string{"actions/checkout@*", "acme/composite/subdir@" + strings.Repeat("a", 40)}, true},
+		{[]string{"owner/*@*"}, false},
+		{[]string{"*/action@*"}, false},
+		{[]string{"owner/action"}, false},
+		{[]string{"owner/action@"}, false},
+		{[]string{"owner/action@v1@other"}, false},
+		{[]string{"owner/action@v1 another"}, false},
+	} {
+		if got, _ := explicitActionPatterns(tc.patterns); got != tc.want {
+			t.Errorf("explicitActionPatterns(%v)=%v, want %v", tc.patterns, got, tc.want)
+		}
 	}
 }
 
@@ -195,8 +236,8 @@ func TestCodeScanningCompliantViaAdvancedSetup(t *testing.T) {
 		"GET /repos/me/app/code-scanning/default-setup": `{"state":"not-configured"}`,
 		"GET /repos/me/app/code-scanning/analyses":      `[{"id":1,"created_at":"2999-01-01T00:00:00Z"}]`,
 	})
-	if got := ctl.Detect(context.Background(), recent, "me", "app", &github.Repository{}); got.Status != StatusCompliant {
-		t.Fatalf("recent analysis: got %s (%s), want compliant", got.Status, got.Detail)
+	if got := ctl.Detect(context.Background(), recent, "me", "app", &github.Repository{}); got.Status != StatusCompliant || got.Prior != "not-configured" {
+		t.Fatalf("recent analysis: got status=%s prior=%q (%s), want compliant/not-configured", got.Status, got.Prior, got.Detail)
 	}
 	stale := mockClient(map[string]string{
 		"GET /repos/me/app/code-scanning/default-setup": `{"state":"not-configured"}`,
@@ -235,7 +276,7 @@ func TestBranchProtectionDetect(t *testing.T) {
 	repo := &github.Repository{DefaultBranch: github.Ptr("main")}
 	has := mockClient(map[string]string{
 		"GET /repos/me/app/rulesets":   `[{"id":7,"name":"repo-harden","enforcement":"active","target":"branch"}]`,
-		"GET /repos/me/app/rulesets/7": `{"id":7,"name":"repo-harden","enforcement":"active","target":"branch","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"pull_request","parameters":{"required_approving_review_count":1,"required_review_thread_resolution":true}},{"type":"non_fast_forward"},{"type":"required_linear_history"}]}`,
+		"GET /repos/me/app/rulesets/7": `{"id":7,"name":"repo-harden","enforcement":"active","target":"branch","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"pull_request","parameters":{"required_approving_review_count":1,"required_review_thread_resolution":true}},{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_linear_history"}]}`,
 	})
 	if got := ctl.Detect(context.Background(), has, "me", "app", repo); got.Status != StatusCompliant {
 		t.Fatalf("valid ruleset: got %s (%s), want compliant", got.Status, got.Detail)
@@ -286,13 +327,17 @@ func TestBranchProtectionApplyCreatesRuleset(t *testing.T) {
 }
 
 func TestBranchProtectionApplyUpdatesExistingInPlace(t *testing.T) {
-	var method, path string
+	var method, path, body string
 	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		switch {
 		case req.Method == http.MethodGet && req.URL.Path == "/repos/me/app/rulesets":
-			return jsonResponse(`[{"id":7,"name":"repo-harden"}]`), nil
-		case req.URL.Path == "/repos/me/app/rulesets/7", req.URL.Path == "/repos/me/app/rulesets":
+			return jsonResponse(`[{"id":7,"name":"repo-harden","target":"branch","enforcement":"disabled"}]`), nil
+		case req.Method == http.MethodGet && req.URL.Path == "/repos/me/app/rulesets/7":
+			return jsonResponse(`{"id":7,"name":"repo-harden","target":"branch","enforcement":"disabled","conditions":{"ref_name":{"include":["refs/heads/release/*"],"exclude":[]}},"bypass_actors":[{"actor_id":1,"actor_type":"RepositoryRole","bypass_mode":"always"}],"rules":[{"type":"required_signatures"}]}`), nil
+		case req.Method == http.MethodPut && req.URL.Path == "/repos/me/app/rulesets/7":
 			method, path = req.Method, req.URL.Path
+			b, _ := io.ReadAll(req.Body)
+			body = string(b)
 			return jsonResponse(`{"id":7,"name":"repo-harden"}`), nil
 		}
 		return &http.Response{StatusCode: 404, Header: make(http.Header), Body: http.NoBody}, nil
@@ -303,6 +348,22 @@ func TestBranchProtectionApplyUpdatesExistingInPlace(t *testing.T) {
 	}
 	if method != http.MethodPut || path != "/repos/me/app/rulesets/7" {
 		t.Fatalf("apply should UpdateRuleset in place, got %s %s", method, path)
+	}
+	for _, preserved := range []string{`required_signatures`, `refs/heads/release/*`, `bypass_actors`, `~DEFAULT_BRANCH`} {
+		if !strings.Contains(body, preserved) {
+			t.Errorf("merged ruleset dropped %q: %s", preserved, body)
+		}
+	}
+}
+
+func TestBranchProtectionApplyRefusesSameNameNonBranchRuleset(t *testing.T) {
+	client := mockClient(map[string]string{
+		"GET /repos/me/app/rulesets":   `[{"id":7,"name":"repo-harden","target":"tag","enforcement":"active"}]`,
+		"GET /repos/me/app/rulesets/7": `{"id":7,"name":"repo-harden","target":"tag","enforcement":"active"}`,
+	})
+	ctl := controlByKey(t, "branch-protection")
+	if err := ctl.Apply(context.Background(), client, "me", "app"); err == nil {
+		t.Fatal("same-name tag ruleset must be refused instead of overwritten")
 	}
 }
 
@@ -499,5 +560,109 @@ func TestValidateControlSelectionRejectsUnknown(t *testing.T) {
 	}
 	if err := validateControlSelection("", "missing"); err == nil {
 		t.Fatal("expected unknown --skip control to fail")
+	}
+}
+
+func TestMutationControlHTTPContracts(t *testing.T) {
+	tests := []struct {
+		name          string
+		control       string
+		operation     string
+		prior         string
+		wantMethod    string
+		wantPath      string
+		wantBodyParts []string
+	}{
+		{"enable vulnerability alerts", "dependabot-alerts", "apply", "", http.MethodPut, "/repos/me/app/vulnerability-alerts", nil},
+		{"restore vulnerability alerts", "dependabot-alerts", "revert", "disabled", http.MethodDelete, "/repos/me/app/vulnerability-alerts", nil},
+		{"enable security fixes", "dependabot-fixes", "apply", "", http.MethodPut, "/repos/me/app/automated-security-fixes", nil},
+		{"restore security fixes", "dependabot-fixes", "revert", "disabled", http.MethodDelete, "/repos/me/app/automated-security-fixes", nil},
+		{"set token policy", "token-readonly", "apply", "", http.MethodPut, "/repos/me/app/actions/permissions/workflow", []string{`"default_workflow_permissions":"read"`, `"can_approve_pull_request_reviews":false`}},
+		{"configure CodeQL", "code-scanning", "apply", "", http.MethodPatch, "/repos/me/app/code-scanning/default-setup", []string{`"state":"configured"`}},
+		{"restore CodeQL", "code-scanning", "revert", "not-configured", http.MethodPatch, "/repos/me/app/code-scanning/default-setup", []string{`"state":"not-configured"`}},
+		{"enable private reporting", "private-vulnerability-reporting", "apply", "", http.MethodPut, "/repos/me/app/private-vulnerability-reporting", nil},
+		{"restore private reporting", "private-vulnerability-reporting", "revert", "disabled", http.MethodDelete, "/repos/me/app/private-vulnerability-reporting", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var method, path, body string
+			client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				method, path = req.Method, req.URL.Path
+				if req.Body != nil {
+					data, _ := io.ReadAll(req.Body)
+					body = string(data)
+				}
+				return &http.Response{StatusCode: http.StatusNoContent, Header: make(http.Header), Body: http.NoBody, Request: req}, nil
+			})})
+			ctl := controlByKey(t, tt.control)
+			var err error
+			if tt.operation == "apply" {
+				err = ctl.Apply(context.Background(), client, "me", "app")
+			} else {
+				err = ctl.Revert(context.Background(), client, "me", "app", tt.prior)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if method != tt.wantMethod || path != tt.wantPath {
+				t.Fatalf("request = %s %s, want %s %s", method, path, tt.wantMethod, tt.wantPath)
+			}
+			for _, part := range tt.wantBodyParts {
+				if !strings.Contains(body, part) {
+					t.Errorf("request body %q missing %q", body, part)
+				}
+			}
+		})
+	}
+}
+
+func TestMutationControlPropagatesAPIErrors(t *testing.T) {
+	for _, key := range []string{"dependabot-alerts", "dependabot-fixes", "token-readonly", "code-scanning", "private-vulnerability-reporting"} {
+		t.Run(key, func(t *testing.T) {
+			client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusInternalServerError,
+					Status:     "500 Internal Server Error",
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{"message":"boom"}`)),
+					Request:    req,
+				}, nil
+			})})
+			if err := controlByKey(t, key).Apply(context.Background(), client, "me", "app"); err == nil {
+				t.Fatal("Apply must propagate the API error")
+			}
+		})
+	}
+}
+
+func TestMutationControlRevertPropagatesAPIErrors(t *testing.T) {
+	tests := []struct {
+		control string
+		prior   string
+	}{
+		{"dependabot-alerts", "disabled"},
+		{"dependabot-fixes", "disabled"},
+		{"token-readonly", `{"default_workflow_permissions":"write","can_approve_pull_request_reviews":true}`},
+		{"branch-protection", ""},
+		{"actions-allowlist", "all"},
+		{"secret-scanning", `{"secret_scanning":"disabled","push_protection":"disabled"}`},
+		{"code-scanning", "not-configured"},
+		{"private-vulnerability-reporting", "disabled"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.control, func(t *testing.T) {
+			client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusInternalServerError,
+					Status:     "500 Internal Server Error",
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{"message":"boom"}`)),
+					Request:    req,
+				}, nil
+			})})
+			if err := controlByKey(t, tt.control).Revert(context.Background(), client, "me", "app", tt.prior); err == nil {
+				t.Fatal("Revert must propagate the API error")
+			}
+		})
 	}
 }

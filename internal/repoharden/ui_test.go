@@ -55,9 +55,9 @@ func TestScoreBarWidth(t *testing.T) {
 }
 
 func TestSanitizeDetailRemovesTerminalControlSequences(t *testing.T) {
-	input := "safe\x1b[31mred\x1b[0m\x1b]0;spoofed title\x07\u009b31m tail"
+	input := "safe\x1b[31mred\x1b[0m\x1b]0;spoofed title\x07\u009b31m\u202eRTL\u2066isolate\u2069 tail"
 	got := sanitizeDetail(input)
-	for _, forbidden := range []string{"\x1b", "\x07", "\u009b", "spoofed title"} {
+	for _, forbidden := range []string{"\x1b", "\x07", "\u009b", "\u202e", "\u2066", "\u2069", "spoofed title"} {
 		if strings.Contains(got, forbidden) {
 			t.Fatalf("sanitizeDetail(%q) retained %q in %q", input, forbidden, got)
 		}

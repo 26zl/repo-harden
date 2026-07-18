@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -62,8 +63,21 @@ func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			return resp, err
 		}
 		wait := rt.retryDelay(req, resp, attempt)
+		if dl, ok := req.Context().Deadline(); ok {
+			now := time.Now
+			if rt.now != nil {
+				now = rt.now
+			}
+			// Waiting past the client timeout can never succeed; surface the response instead.
+			if dl.Sub(now()) <= wait+time.Second {
+				return resp, err
+			}
+		}
 		if resp != nil {
 			_ = resp.Body.Close()
+		}
+		if wait >= 2*time.Second {
+			fmt.Fprintf(os.Stderr, "rate limited or server busy; retrying in %s\n", wait.Round(time.Second))
 		}
 		if err := rt.wait(req.Context(), wait); err != nil {
 			return nil, err

@@ -7,16 +7,37 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.repository }}
+  queue: max
+  cancel-in-progress: false
+
 jobs:
-  # Run the full gate before granting release credentials.
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the tag to match the current main tip
+        run: |
+          numeric_identifier='0|[1-9][0-9]*'
+          nonnumeric_identifier='[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*'
+          prerelease_identifier="(${numeric_identifier}|${nonnumeric_identifier})"
+          semver="^v(${numeric_identifier})\.(${numeric_identifier})\.(${numeric_identifier})(-${prerelease_identifier}(\.${prerelease_identifier})*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$"
+          [[ "$GITHUB_REF_NAME" =~ $semver ]]
+          git fetch --no-tags --force origin refs/heads/main:refs/remotes/origin/main
+          test "$(git rev-list -n 1 "$GITHUB_REF_NAME")" = "$GITHUB_SHA"
+          test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: "1.15.8"
+          terraform_wrapper: false
       - name: gofmt
         run: |
           unformatted=$(gofmt -l .)
@@ -25,49 +46,619 @@ jobs:
         run: go vet ./...
       - name: build
         run: go build ./...
-      - name: test (race + coverage)
+      - name: test (race + coverage + Terraform fixture)
+        env:
+          REPO_HARDEN_TERRAFORM_TEST: "1"
         run: |
           go test -race -coverprofile=coverage.out ./...
           total=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%", "", $3); print $3}')
-          awk -v total="$total" 'BEGIN { if (total < 55.0) { printf "coverage %.1f%% is below 55.0%%\n", total; exit 1 } }'
+          awk -v total="$total" 'BEGIN { if (total < 70.0) { printf "coverage %.1f%% is below 70.0%%\n", total; exit 1 } }'
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.5.0 ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
       - name: staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
       - name: actionlint
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: third-party license policy
+        run: |
+          go run github.com/google/go-licenses@v1.6.0 check \
+            --allowed_licenses=Apache-2.0,BSD-2-Clause,BSD-3-Clause,MIT \
+            ./cmd/repo-harden
+          runtime_modules=$(go list -deps \
+            -f '{{with .Module}}{{if not .Main}}{{.Path}} {{.Version}}{{end}}{{end}}' \
+            ./cmd/repo-harden | sed '/^$/d' | sort -u)
+          while read -r module version; do
+            grep -Fq "$module $version" THIRD_PARTY_LICENSES.txt || {
+              echo "THIRD_PARTY_LICENSES.txt is missing runtime module $module $version" >&2
+              exit 1
+            }
+          done <<< "$runtime_modules"
+          go_version=$(go env GOVERSION)
+          grep -Fq "Go standard library ${go_version#go}" THIRD_PARTY_LICENSES.txt
       - name: GoReleaser config
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
-          version: "2.16.0"
+          version: "2.17.0"
           args: check
 
-  goreleaser:
+  build:
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
+      contents: read
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
-      - uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
-      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
-        with:
-          version: "2.16.0"
-          args: release --clean
+      - name: Install immutable Syft release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
+          SYFT_VERSION: "1.46.0"
+          SYFT_SHA256: "d654f678b709eb53c393d38519d5ed7d2e57205529404018614cfefa0fb2b5ca"
+        run: |
+          archive="$RUNNER_TEMP/syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz" \
+            --output "$archive"
+          echo "$SYFT_SHA256  $archive" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/syft-bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/syft-bin" syft
+          echo "$RUNNER_TEMP/syft-bin" >> "$GITHUB_PATH"
+      - name: Build release artifacts without publishing
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
-          subject-path: |
+          version: "2.17.0"
+          args: release --clean --skip=publish
+      - name: Upload immutable release bundle
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: release-artifacts-${{ github.run_id }}
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 31
+          path: |
             dist/*.tar.gz
             dist/*.zip
             dist/checksums.txt
             dist/*.sbom.json
+
+  attest:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-artifacts-${{ github.run_id }}
+          path: release-artifacts
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
+        with:
+          subject-path: release-artifacts/*
+
+  create-draft:
+    needs: [test, build, attest, smoke-unix, smoke-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.create.outputs.release_id }}
+      release_state: ${{ steps.create.outputs.release_state }}
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-artifacts-${{ github.run_id }}
+          path: release-artifacts
+      - name: Create draft after attestation and native smoke tests
+        id: create
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh_version=$(gh version | awk 'NR == 1 {print $3}')
+          gh_major=${gh_version%%.*}
+          gh_minor=${gh_version#*.}
+          gh_minor=${gh_minor%%.*}
+          [[ "$gh_major" =~ ^[0-9]+$ && "$gh_minor" =~ ^[0-9]+$ ]]
+          (( gh_major > 2 || (gh_major == 2 && gh_minor >= 93) ))
+
+          resolve_tag_target() {
+            object=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME")
+            object_type=$(jq -r .object.type <<<"$object")
+            object_sha=$(jq -r .object.sha <<<"$object")
+            for _ in 1 2 3 4 5; do
+              case "$object_type" in
+                commit)
+                  echo "$object_sha"
+                  return 0
+                  ;;
+                tag)
+                  object=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha")
+                  object_type=$(jq -r .object.type <<<"$object")
+                  object_sha=$(jq -r .object.sha <<<"$object")
+                  ;;
+                *)
+                  echo "unsupported tag target type: $object_type" >&2
+                  return 1
+                  ;;
+              esac
+            done
+            echo "tag indirection exceeds five levels" >&2
+            return 1
+          }
+          test "$(resolve_tag_target)" = "$GITHUB_SHA"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled)" = true
+
+          prerelease=false
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "${version%%+*}" == *-* ]]; then
+            prerelease=true
+          fi
+
+          run_marker="<!-- repo-harden-run:${GITHUB_RUN_ID} -->"
+          publish_marker="<!-- repo-harden-published:${GITHUB_RUN_ID} -->"
+          lookup_release() {
+            candidate_id=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --json databaseId --jq .databaseId 2>/dev/null || true)
+            if [[ "$candidate_id" =~ ^[0-9]+$ ]]; then
+              gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+                "repos/$GITHUB_REPOSITORY/releases/$candidate_id" 2>/dev/null || true
+            fi
+          }
+          release=$(lookup_release)
+          if test -z "$release"; then
+            if ! release=$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+              --method POST "repos/$GITHUB_REPOSITORY/releases" \
+              -f tag_name="$GITHUB_REF_NAME" \
+              -f target_commitish="$GITHUB_SHA" \
+              -f name="$GITHUB_REF_NAME" \
+              -f body="$run_marker" \
+              -F draft=true \
+              -F prerelease="$prerelease" \
+              -F generate_release_notes=true); then
+              release=
+              for delay in 0 1 2 3 4 5; do
+                if test "$delay" -gt 0; then
+                  sleep "$delay"
+                fi
+                candidate=$(lookup_release)
+                if jq -e --arg marker "$run_marker" \
+                  '((.body // "") | contains($marker))' \
+                  <<<"$candidate" >/dev/null 2>&1; then
+                  release=$candidate
+                  break
+                fi
+              done
+              test -n "$release"
+            fi
+          fi
+          jq -e --arg marker "$run_marker" --arg publish "$publish_marker" --arg tag "$GITHUB_REF_NAME" \
+            --argjson prerelease "$prerelease" \
+            '.tag_name == $tag and .name == $tag and
+             .prerelease == $prerelease and
+             ((.body // "") as $body | ($body | contains($marker)) and
+              ((.draft == true and ($body | contains($publish) | not)) or
+               (.draft == false and .immutable == true and ($body | contains($publish)))))' \
+            <<<"$release" >/dev/null
+          release_id=$(jq -r .id <<<"$release")
+          [[ "$release_id" =~ ^[0-9]+$ ]]
+          if test "$(jq -r .draft <<<"$release")" = true; then
+            release_state=draft
+          else
+            release_state=published
+          fi
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+          echo "release_state=$release_state" >> "$GITHUB_OUTPUT"
+      - name: Upload or recover the exact bundle on the draft
+        if: ${{ steps.create.outputs.release_state == 'draft' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_RELEASE_ID: ${{ steps.create.outputs.release_id }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          prerelease=false
+          if [[ "${version%%+*}" == *-* ]]; then
+            prerelease=true
+          fi
+          run_marker="<!-- repo-harden-run:${GITHUB_RUN_ID} -->"
+          publish_marker="<!-- repo-harden-published:${GITHUB_RUN_ID} -->"
+          load_release() {
+            release=$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/releases/$EXPECTED_RELEASE_ID")
+            jq -e --arg id "$EXPECTED_RELEASE_ID" --arg tag "$GITHUB_REF_NAME" \
+              --arg marker "$run_marker" --arg publish "$publish_marker" --argjson prerelease "$prerelease" \
+              '(.id | tostring) == $id and .tag_name == $tag and .name == $tag and
+               .draft == true and .prerelease == $prerelease and
+               ((.body // "") as $body | ($body | contains($marker)) and
+                ($body | contains($publish) | not))' <<<"$release" >/dev/null
+          }
+          delete_safe_starters() {
+            load_release || return 1
+            for artifact in release-artifacts/*; do
+              test -f "$artifact" || return 1
+              asset_name=$(basename "$artifact")
+              name_count=$(jq --arg name "$asset_name" \
+                '[.assets[] | select(.name == $name)] | length' <<<"$release") || return 1
+              starter_count=$(jq --arg name "$asset_name" \
+                '[.assets[] | select(.name == $name and .state == "starter" and .size == 0)] | length' \
+                <<<"$release") || return 1
+              if test "$starter_count" = 0; then
+                continue
+              fi
+              test "$name_count" = 1 && test "$starter_count" = 1 || return 1
+              starter_id=$(jq -r --arg name "$asset_name" \
+                '.assets[] | select(.name == $name and .state == "starter" and .size == 0) | .id' \
+                <<<"$release") || return 1
+              [[ "$starter_id" =~ ^[0-9]+$ ]] || return 1
+              starter=$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$starter_id") || return 1
+              jq -e --arg id "$starter_id" --arg name "$asset_name" \
+                '(.id | tostring) == $id and .name == $name and .state == "starter" and .size == 0' \
+                <<<"$starter" >/dev/null || return 1
+              if ! gh api -H 'X-GitHub-Api-Version: 2026-03-10' --method DELETE \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$starter_id" >/dev/null; then
+                echo "starter asset cleanup response for $asset_name was unsuccessful; rechecking server state" >&2
+              fi
+            done
+          }
+          validate_existing_assets() {
+            load_release || return 1
+            matched=0
+            for artifact in release-artifacts/*; do
+              test -f "$artifact" || return 1
+              asset_name=$(basename "$artifact")
+              asset_digest="sha256:$(sha256sum "$artifact" | awk '{print $1}')"
+              asset_size=$(wc -c < "$artifact" | tr -d ' ')
+              name_count=$(jq --arg name "$asset_name" '[.assets[] | select(.name == $name)] | length' <<<"$release") || return 1
+              exact_count=$(jq --arg name "$asset_name" --arg digest "$asset_digest" --argjson size "$asset_size" \
+                '[.assets[] | select(.name == $name and .digest == $digest and .size == $size and .state == "uploaded")] | length' \
+                <<<"$release") || return 1
+              if test "$name_count" = 0; then
+                test "$exact_count" = 0 || return 1
+              elif test "$name_count" = 1 && test "$exact_count" = 1; then
+                matched=$((matched + 1))
+              else
+                echo "existing release asset $asset_name does not match the build artifact" >&2
+                return 1
+              fi
+            done
+            test "$(jq '.assets | length' <<<"$release")" = "$matched"
+          }
+          verify_assets() {
+            validate_existing_assets || return 1
+            expected_count=$(find release-artifacts -maxdepth 1 -type f | wc -l | tr -d ' ')
+            test "$(jq '.assets | length' <<<"$release")" = "$expected_count"
+          }
+          sync_assets() {
+            delete_safe_starters || return 1
+            validate_existing_assets || return 1
+            for artifact in release-artifacts/*; do
+              load_release || return 1
+              asset_name=$(basename "$artifact")
+              asset_digest="sha256:$(sha256sum "$artifact" | awk '{print $1}')"
+              asset_size=$(wc -c < "$artifact" | tr -d ' ')
+              exact_count=$(jq --arg name "$asset_name" --arg digest "$asset_digest" --argjson size "$asset_size" \
+                '[.assets[] | select(.name == $name and .digest == $digest and .size == $size and .state == "uploaded")] | length' \
+                <<<"$release") || return 1
+              if test "$exact_count" = 0; then
+                test "$(jq --arg name "$asset_name" '[.assets[] | select(.name == $name)] | length' <<<"$release")" = 0 || return 1
+                if ! gh release upload "$GITHUB_REF_NAME" "$artifact" --repo "$GITHUB_REPOSITORY"; then
+                  echo "upload response for $asset_name was unsuccessful; rechecking server state" >&2
+                fi
+              fi
+            done
+            verify_assets
+          }
+          recovered=false
+          for delay in 0 1 2 4 8 15; do
+            if test "$delay" -gt 0; then
+              sleep "$delay"
+            fi
+            if sync_assets; then
+              recovered=true
+              break
+            fi
+          done
+          if test "$recovered" != true; then
+            echo "draft bundle is incomplete or differs from the build artifact" >&2
+            exit 1
+          fi
+
+  smoke-unix:
+    needs: attest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_os: linux
+            artifact_arch: amd64
+          - os: ubuntu-24.04-arm
+            artifact_os: linux
+            artifact_arch: arm64
+          - os: macos-15-intel
+            artifact_os: darwin
+            artifact_arch: amd64
+          - os: macos-latest
+            artifact_os: darwin
+            artifact_arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      attestations: read
+      contents: read
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-artifacts-${{ github.run_id }}
+          path: expected-assets
+      - name: Verify and run the attested archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_OS: ${{ matrix.artifact_os }}
+          ARTIFACT_ARCH: ${{ matrix.artifact_arch }}
+        run: |
+          gh_version=$(gh version | awk 'NR == 1 {print $3}')
+          gh_major=${gh_version%%.*}
+          gh_minor=${gh_version#*.}
+          gh_minor=${gh_minor%%.*}
+          [[ "$gh_major" =~ ^[0-9]+$ && "$gh_minor" =~ ^[0-9]+$ ]]
+          (( gh_major > 2 || (gh_major == 2 && gh_minor >= 93) ))
+
+          version="${GITHUB_REF_NAME#v}"
+          archive="repo-harden_${version}_${ARTIFACT_OS}_${ARTIFACT_ARCH}.tar.gz"
+          expected_archive="expected-assets/$archive"
+          test -f "$expected_archive"
+          test -f expected-assets/checksums.txt
+          checksum_matches=$(awk -v file="$archive" '$2 == file {count++} END {print count+0}' expected-assets/checksums.txt)
+          test "$checksum_matches" = 1
+          expected=$(awk -v file="$archive" '$2 == file {print $1}' expected-assets/checksums.txt)
+          test "$(shasum -a 256 "$expected_archive" | awk '{print $1}')" = "$expected"
+          gh attestation verify "$expected_archive" --repo "$GITHUB_REPOSITORY"
+          mkdir extracted
+          tar -xzf "$expected_archive" -C extracted
+          ./extracted/repo-harden version
+
+  smoke-windows:
+    needs: attest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_arch: amd64
+          - os: windows-11-arm
+            artifact_arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      attestations: read
+      contents: read
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-artifacts-${{ github.run_id }}
+          path: expected-assets
+      - name: Verify and run the attested archive
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ARCH: ${{ matrix.artifact_arch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($PSVersionTable.PSVersion -lt [version]'7.3') { throw "PowerShell 7.3 or newer is required" }
+          $PSNativeCommandUseErrorActionPreference = $true
+          $ghVersion = (gh version | Select-Object -First 1).Split()[2]
+          if ([version]$ghVersion -lt [version]'2.93.0') { throw "GitHub CLI 2.93.0 or newer is required" }
+
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $archive = "repo-harden_${version}_windows_$env:ARTIFACT_ARCH.zip"
+          $expectedArchive = Join-Path expected-assets $archive
+          $expectedChecksums = Join-Path expected-assets checksums.txt
+          if (-not (Test-Path -PathType Leaf $expectedArchive) -or -not (Test-Path -PathType Leaf $expectedChecksums)) {
+            throw "current-run release artifact is missing"
+          }
+          $matchingLines = @(Get-Content $expectedChecksums | Where-Object { $_ -match "\s+$([regex]::Escape($archive))$" })
+          if ($matchingLines.Count -ne 1) { throw "archive must occur exactly once in checksums.txt" }
+          $expected = ($matchingLines[0].Trim() -split '\s+')[0].ToLowerInvariant()
+          $actual = (Get-FileHash -Algorithm SHA256 $expectedArchive).Hash.ToLowerInvariant()
+          if (-not $expected -or $actual -ne $expected.ToLowerInvariant()) { throw "checksum mismatch" }
+
+          gh attestation verify $expectedArchive --repo $env:GITHUB_REPOSITORY
+          Expand-Archive -Path $expectedArchive -DestinationPath extracted
+          & .\extracted\repo-harden.exe version
+
+  report-unpublished-draft:
+    needs: [create-draft, smoke-unix, smoke-windows, publish]
+    if: ${{ always() && needs['create-draft'].result != 'skipped' && needs.publish.result != 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      # Draft releases are invisible to a read-only token, so report the recorded ID without API lookups.
+      - name: Report the exact draft that needs operator cleanup
+        env:
+          EXPECTED_RELEASE_ID: ${{ needs['create-draft'].outputs.release_id }}
+        run: |
+          if test -n "$EXPECTED_RELEASE_ID"; then
+            echo "::warning::draft release ID $EXPECTED_RELEASE_ID for $GITHUB_REF_NAME was not published; an operator must inspect and delete that exact draft before retrying"
+          else
+            echo "::warning::no draft attributable to this workflow run was found; no cleanup was attempted"
+          fi
+
+  publish:
+    needs: [create-draft, smoke-unix, smoke-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-artifacts-${{ github.run_id }}
+          path: expected-assets
+      - name: Reverify the exact draft bundle after environment approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_RELEASE_ID: ${{ needs['create-draft'].outputs.release_id }}
+          EXPECTED_RELEASE_STATE: ${{ needs['create-draft'].outputs.release_state }}
+        run: |
+          gh_version=$(gh version | awk 'NR == 1 {print $3}')
+          gh_major=${gh_version%%.*}
+          gh_minor=${gh_version#*.}
+          gh_minor=${gh_minor%%.*}
+          [[ "$gh_major" =~ ^[0-9]+$ && "$gh_minor" =~ ^[0-9]+$ ]]
+          (( gh_major > 2 || (gh_major == 2 && gh_minor >= 93) ))
+          gh release verify --help >/dev/null
+          gh release verify-asset --help >/dev/null
+
+          resolve_tag_target() {
+            object=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME")
+            object_type=$(jq -r .object.type <<<"$object")
+            object_sha=$(jq -r .object.sha <<<"$object")
+            for _ in 1 2 3 4 5; do
+              case "$object_type" in
+                commit)
+                  echo "$object_sha"
+                  return 0
+                  ;;
+                tag)
+                  object=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha")
+                  object_type=$(jq -r .object.type <<<"$object")
+                  object_sha=$(jq -r .object.sha <<<"$object")
+                  ;;
+                *)
+                  echo "unsupported tag target type: $object_type" >&2
+                  return 1
+                  ;;
+              esac
+            done
+            echo "tag indirection exceeds five levels" >&2
+            return 1
+          }
+          version="${GITHUB_REF_NAME#v}"
+          prerelease=false
+          if [[ "${version%%+*}" == *-* ]]; then
+            prerelease=true
+          fi
+          case "$EXPECTED_RELEASE_STATE" in
+            draft|published) ;;
+            *) echo "invalid expected release state" >&2; exit 1 ;;
+          esac
+          run_marker="<!-- repo-harden-run:${GITHUB_RUN_ID} -->"
+          publish_marker="<!-- repo-harden-published:${GITHUB_RUN_ID} -->"
+          verify_release_identity() {
+            draft=$1
+            release=$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/releases/$EXPECTED_RELEASE_ID")
+            jq -e --arg id "$EXPECTED_RELEASE_ID" --arg tag "$GITHUB_REF_NAME" \
+              --arg marker "$run_marker" --arg publish "$publish_marker" \
+              --argjson draft "$draft" --argjson prerelease "$prerelease" \
+              '(.id | tostring) == $id and .tag_name == $tag and .name == $tag and
+               .draft == $draft and .prerelease == $prerelease and
+               ((.body // "") as $body | ($body | contains($marker)) and
+                (if $draft then ($body | contains($publish) | not)
+                 else .immutable == true and ($body | contains($publish)) end))' \
+              <<<"$release" >/dev/null
+          }
+          verify_server_assets() {
+            release=$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/releases/$EXPECTED_RELEASE_ID")
+            expected_count=$(find expected-assets -maxdepth 1 -type f | wc -l | tr -d ' ')
+            test "$(jq '.assets | length' <<<"$release")" = "$expected_count"
+            for artifact in expected-assets/*; do
+              test -f "$artifact"
+              asset_name=$(basename "$artifact")
+              asset_digest="sha256:$(sha256sum "$artifact" | awk '{print $1}')"
+              asset_size=$(wc -c < "$artifact" | tr -d ' ')
+              test "$(jq --arg name "$asset_name" --arg digest "$asset_digest" --argjson size "$asset_size" \
+                '[.assets[] | select(.name == $name and .digest == $digest and .size == $size and .state == "uploaded")] | length' \
+                <<<"$release")" = 1
+            done
+          }
+
+          test "$(resolve_tag_target)" = "$GITHUB_SHA"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled)" = true
+          if test "$EXPECTED_RELEASE_STATE" = draft; then
+            if verify_release_identity true; then
+              current_draft=true
+            elif verify_release_identity false; then
+              current_draft=false
+            else
+              echo "release is neither the expected draft nor a recoverable workflow-published release" >&2
+              exit 1
+            fi
+          else
+            verify_release_identity false
+            current_draft=false
+          fi
+          mkdir release-assets
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir release-assets
+
+          make_manifest() {
+            directory=$1
+            (cd "$directory" && find . -maxdepth 1 -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum --zero)
+          }
+          make_manifest expected-assets > expected.manifest
+          make_manifest release-assets > release.manifest
+          if ! cmp --silent expected.manifest release.manifest; then
+            echo "release assets no longer match the immutable build artifact" >&2
+            exit 1
+          fi
+
+          (cd release-assets && sha256sum --check --strict checksums.txt)
+          for artifact in release-assets/*; do
+            test -f "$artifact"
+            gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY"
+          done
+
+          verify_server_assets
+          test "$(resolve_tag_target)" = "$GITHUB_SHA"
+          verify_release_identity "$current_draft"
+          if test "$current_draft" = true; then
+            published_body="$(jq -r '.body // ""' <<<"$release")"$'\n'"$publish_marker"
+            if ! gh api -H 'X-GitHub-Api-Version: 2026-03-10' --method PATCH \
+              "repos/$GITHUB_REPOSITORY/releases/$EXPECTED_RELEASE_ID" \
+              -f body="$published_body" -F draft=false >/dev/null; then
+              echo "publish response was unsuccessful; verifying final server state before failing" >&2
+            fi
+          fi
+          published=false
+          for delay in 0 1 2 4 8 15; do
+            if test "$delay" -gt 0; then
+              sleep "$delay"
+            fi
+            if verify_release_identity false; then
+              published=true
+              break
+            fi
+          done
+          test "$published" = true
+          test "$(resolve_tag_target)" = "$GITHUB_SHA"
+          verify_server_assets
+          release_verified=false
+          for delay in 0 1 2 4 8 15; do
+            if test "$delay" -gt 0; then
+              sleep "$delay"
+            fi
+            if gh release verify "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"; then
+              release_verified=true
+              break
+            fi
+          done
+          test "$release_verified" = true
+          for artifact in expected-assets/*; do
+            gh release verify-asset "$GITHUB_REF_NAME" "$artifact" --repo "$GITHUB_REPOSITORY"
+          done

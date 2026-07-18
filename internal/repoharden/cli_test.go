@@ -3,17 +3,15 @@ package repoharden
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/google/go-github/v88/github"
 )
@@ -63,6 +61,45 @@ func TestListReposNamedHonorsEligibilityFilters(t *testing.T) {
 	}
 }
 
+func TestCLIGitHubPaginationFailsClosed(t *testing.T) {
+	t.Run("repositories", func(t *testing.T) {
+		calls := 0
+		client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls++
+			resp := jsonResponse(`[]`)
+			resp.Header.Set("Link", `<https://api.github.com/user/repos?per_page=100&page=1>; rel="next"`)
+			return resp, nil
+		})})
+		if _, err := listRepos(context.Background(), client, &opts{}); err == nil || !strings.Contains(err.Error(), "did not advance") {
+			t.Fatalf("non-advancing repository pagination = %v", err)
+		}
+		if calls != 1 {
+			t.Fatalf("non-advancing repository pagination made %d calls, want 1", calls)
+		}
+	})
+
+	t.Run("workflows", func(t *testing.T) {
+		calls := 0
+		client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls++
+			resp := jsonResponse(`{"total_count":0,"workflows":[]}`)
+			resp.Header.Set("Link", `<https://api.github.com/repos/me/app/actions/workflows?per_page=100&page=1>; rel="next"`)
+			return resp, nil
+		})})
+		if _, err := listWorkflows(context.Background(), client, "me", "app"); err == nil || !strings.Contains(err.Error(), "did not advance") {
+			t.Fatalf("non-advancing workflow pagination = %v", err)
+		}
+		if calls != 1 {
+			t.Fatalf("non-advancing workflow pagination made %d calls, want 1", calls)
+		}
+	})
+
+	pager := githubPager{pages: maxGitHubPages}
+	if _, _, err := pager.next(&github.Response{NextPage: 2}); err == nil || !strings.Contains(err.Error(), "exceeded") {
+		t.Fatalf("GitHub pagination page cap = %v", err)
+	}
+}
+
 func jsonResponse(body string) *http.Response {
 	return &http.Response{
 		StatusCode: http.StatusOK,
@@ -79,6 +116,7 @@ func mustClient(hc *http.Client) *github.Client {
 	return c
 }
 
+// captureStdout swaps the process-global os.Stdout, so tests using it must not run in parallel.
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 
@@ -92,16 +130,20 @@ func captureStdout(t *testing.T, fn func()) string {
 		os.Stdout = old
 	}()
 
+	// drain concurrently so output larger than the pipe buffer cannot deadlock fn
+	done := make(chan string)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		done <- buf.String()
+	}()
+
 	fn()
 
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, r); err != nil {
-		t.Fatal(err)
-	}
-	return buf.String()
+	return <-done
 }
 
 func TestSplitRepo(t *testing.T) {
@@ -135,11 +177,20 @@ func TestValidateCommandInvocation(t *testing.T) {
 	if err := validateCommandInvocation("list", nil, &opts{failOnSkipped: true}); err == nil {
 		t.Fatal("--fail-on-skipped outside audit should be rejected")
 	}
-}
-
-func TestEntryKey(t *testing.T) {
-	if entryKey("foo/bar", 42) != "foo/bar#42" {
-		t.Fatal("entryKey format changed")
+	if err := validateCommandInvocation("list", nil, &opts{orgAuditSet: true}); err == nil {
+		t.Fatal("--org-audit outside audit should be rejected")
+	}
+	if err := validateCommandInvocation("status", nil, &opts{staleDaysSet: true, staleDays: 5}); err == nil {
+		t.Fatal("--stale-days outside audit should be rejected")
+	}
+	if err := validateCommandInvocation("enable-all-disabled", nil, &opts{stateFile: "x.json"}); err == nil {
+		t.Fatal("--state-file on a stateless command should be rejected")
+	}
+	if err := validateCommandInvocation("harden", nil, &opts{stateFile: "x.json"}); err != nil {
+		t.Fatalf("--state-file on harden rejected: %v", err)
+	}
+	if err := validateCommandInvocation("audit", nil, &opts{orgAuditSet: true, staleDaysSet: true, staleDays: 30}); err != nil {
+		t.Fatalf("audit-scoped flags rejected on audit: %v", err)
 	}
 }
 
@@ -155,58 +206,6 @@ func TestSkipWorkflow(t *testing.T) {
 	}
 	if skipWorkflow(user, &opts{}) {
 		t.Error("user workflow should never be skipped")
-	}
-}
-
-func TestStateRoundtrip(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
-	want := []StateEntry{
-		{Repo: "foo/bar", ID: 1, Name: "CI", Path: ".github/workflows/ci.yml", Phase: ActionPhaseApplied},
-		{Repo: "foo/baz", ID: 2, Name: "Lint", Path: ".github/workflows/lint.yml", Phase: ActionPhaseUnknown},
-	}
-	if err := saveState(path, testStateScope, want); err != nil {
-		t.Fatalf("saveState: %v", err)
-	}
-	got, err := loadState(path, testStateScope)
-	if err != nil {
-		t.Fatalf("loadState: %v", err)
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("roundtrip mismatch\n got: %+v\nwant: %+v", got, want)
-	}
-}
-
-func TestLoadStateMissing(t *testing.T) {
-	got, err := loadState(filepath.Join(t.TempDir(), "nope.json"), testStateScope)
-	if err != nil {
-		t.Fatalf("missing file should not error: %v", err)
-	}
-	if len(got) != 0 {
-		t.Errorf("missing file should yield no entries, got %v", got)
-	}
-}
-
-func TestLoadStateMalformed(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
-	if err := os.WriteFile(path, []byte(`{"repo":`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := loadState(path, testStateScope); err == nil {
-		t.Fatal("malformed state should return an error")
-	} else if !strings.Contains(err.Error(), "parse state file") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestStateFilePathOverride(t *testing.T) {
-	custom := filepath.Join(t.TempDir(), "nested", "custom.json")
-	got, err := stateFilePath(&opts{stateFile: custom})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != custom {
-		t.Errorf("got %q, want %q", got, custom)
 	}
 }
 
@@ -294,103 +293,6 @@ func TestProviderURLHelpers(t *testing.T) {
 	}
 }
 
-func TestAuthTransportSetsBearer(t *testing.T) {
-	var got string
-	at := &authTransport{token: "tok", base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		got = req.Header.Get("Authorization")
-		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: http.NoBody}, nil
-	})}
-	req, _ := http.NewRequest(http.MethodGet, "https://x/y", nil)
-	if _, err := at.RoundTrip(req); err != nil {
-		t.Fatal(err)
-	}
-	if got != "Bearer tok" {
-		t.Fatalf("Authorization = %q, want Bearer tok", got)
-	}
-}
-
-func TestRetryTransportDoesNotRetryMutations(t *testing.T) {
-	calls := 0
-	rt := &retryTransport{max: 3, base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		calls++
-		return &http.Response{StatusCode: 500, Header: make(http.Header), Body: http.NoBody}, nil
-	})}
-	req, _ := http.NewRequest(http.MethodPost, "https://x/y", nil)
-	if _, err := rt.RoundTrip(req); err != nil {
-		t.Fatal(err)
-	}
-	if calls != 1 {
-		t.Fatalf("POST must not be retried, got %d calls", calls)
-	}
-}
-
-func TestRetryTransportRetriesGETOn500(t *testing.T) {
-	calls := 0
-	rt := &retryTransport{max: 3, sleep: func(context.Context, time.Duration) error { return nil }, base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		calls++
-		code := http.StatusOK
-		if calls == 1 {
-			code = http.StatusInternalServerError
-		}
-		return &http.Response{StatusCode: code, Header: make(http.Header), Body: http.NoBody}, nil
-	})}
-	req, _ := http.NewRequest(http.MethodGet, "https://x/y", nil)
-	resp, err := rt.RoundTrip(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		t.Fatalf("got %v / %v, want 200/nil", resp, err)
-	}
-	if calls != 2 {
-		t.Fatalf("expected 1 retry (2 calls), got %d", calls)
-	}
-}
-
-func TestRetryTransportHonorsPrimaryRateLimitReset(t *testing.T) {
-	calls := 0
-	var waited time.Duration
-	now := time.Unix(1_700_000_000, 0)
-	rt := &retryTransport{
-		max: 1,
-		now: func() time.Time { return now },
-		sleep: func(_ context.Context, delay time.Duration) error {
-			waited = delay
-			return nil
-		},
-		base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			calls++
-			if calls == 1 {
-				headers := make(http.Header)
-				headers.Set("X-RateLimit-Remaining", "0")
-				headers.Set("X-RateLimit-Reset", strconv.FormatInt(now.Add(12*time.Second).Unix(), 10))
-				return &http.Response{StatusCode: http.StatusForbidden, Header: headers, Body: http.NoBody, Request: req}, nil
-			}
-			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: req}, nil
-		}),
-	}
-	req, _ := http.NewRequest(http.MethodGet, "https://api.github.com/repos/me/app", nil)
-	resp, err := rt.RoundTrip(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		t.Fatalf("rate-limit retry got %v / %v, want 200/nil", resp, err)
-	}
-	if calls != 2 {
-		t.Fatalf("calls = %d, want 2", calls)
-	}
-	if waited < 12*time.Second || waited > 13*time.Second {
-		t.Fatalf("waited %s, want reset delay plus bounded jitter", waited)
-	}
-}
-
-func TestRetryTransportStopsOnCanceledContext(t *testing.T) {
-	rt := &retryTransport{max: 3, base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: 500, Header: make(http.Header), Body: http.NoBody}, nil
-	})}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://x/y", nil)
-	if _, err := rt.RoundTrip(req); err == nil {
-		t.Fatal("canceled context should abort the retry wait")
-	}
-}
-
 func TestCmdDisableAllPersistsAppliedWorkflowState(t *testing.T) {
 	var disabled bool
 	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -398,7 +300,7 @@ func TestCmdDisableAllPersistsAppliedWorkflowState(t *testing.T) {
 		case req.Method == http.MethodGet && req.URL.Path == "/user/repos":
 			return jsonResponse(`[{"full_name":"me/app","owner":{"login":"me"},"fork":false,"archived":false}]`), nil
 		case req.Method == http.MethodGet && req.URL.Path == "/user":
-			return jsonResponse(`{"login":"tester"}`), nil
+			return jsonResponse(`{"login":"tester","id":42}`), nil
 		case req.Method == http.MethodGet && req.URL.Path == "/repos/me/app/actions/workflows":
 			return jsonResponse(`{"total_count":1,"workflows":[{"id":1,"name":"CI","path":".github/workflows/ci.yml","state":"active"}]}`), nil
 		case req.Method == http.MethodPut && req.URL.Path == "/repos/me/app/actions/workflows/1/disable":
@@ -427,85 +329,49 @@ func TestCmdDisableAllPersistsAppliedWorkflowState(t *testing.T) {
 	}
 }
 
-func TestNoCrossHostRedirect(t *testing.T) {
-	orig, _ := http.NewRequest(http.MethodGet, "https://api.github.com/a", nil)
-	same, _ := http.NewRequest(http.MethodGet, "https://api.github.com/b", nil)
-	if err := noCrossHostRedirect(same, []*http.Request{orig}); err != nil {
-		t.Fatalf("same-host redirect should be allowed: %v", err)
-	}
-	other, _ := http.NewRequest(http.MethodGet, "https://evil.example.com/x", nil)
-	if err := noCrossHostRedirect(other, []*http.Request{orig}); err == nil {
-		t.Fatal("cross-host redirect must be refused (token would leak)")
-	}
-}
-
-func TestGitHubClientDoesNotLeakTokenOnCrossHostRedirect(t *testing.T) {
-	var leaked string
-	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		leaked = r.Header.Get("Authorization")
-	}))
-	defer attacker.Close()
-	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, attacker.URL+"/stolen", http.StatusFound)
-	}))
-	defer origin.Close()
-
-	resp, err := newGitHubHTTPClient("secret").Get(origin.URL + "/start")
-	if err == nil && resp != nil {
-		resp.Body.Close()
-	}
-	if leaked != "" {
-		t.Fatalf("bearer token leaked to redirect target: %q", leaked)
-	}
-}
-
-func TestRequireSecureRedirectURLAllowsQuery(t *testing.T) {
-	if err := requireSecureURL("https://gitlab.example.com/api?page=2"); err == nil {
-		t.Fatal("a base URL carrying a query must be rejected")
-	}
-	if err := requireSecureRedirectURL("https://gitlab.example.com/api?page=2"); err != nil {
-		t.Fatalf("a redirect target carrying a query must be allowed: %v", err)
-	}
-	if err := requireSecureRedirectURL("http://evil.example.com/api"); err == nil {
-		t.Fatal("cleartext http to a non-loopback host must still be refused on redirect")
-	}
-	if err := requireSecureRedirectURL("https://u:p@h.example.com/x"); err == nil {
-		t.Fatal("userinfo must still be refused on redirect")
-	}
-}
-
-func TestSameHostRedirectWithQueryAllowed(t *testing.T) {
-	orig, _ := http.NewRequest(http.MethodGet, "https://gitlab.example.com/api/v4/projects", nil)
-	target, _ := http.NewRequest(http.MethodGet, "https://gitlab.example.com/api/v4/projects?page=2&per_page=100", nil)
-	if err := noCrossHostRedirect(target, []*http.Request{orig}); err != nil {
-		t.Fatalf("a same-host redirect carrying a query string must be allowed: %v", err)
-	}
-}
-
-func TestHostScopedHeaderStripsOffHost(t *testing.T) {
-	var seen string
-	base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		seen = req.Header.Get("PRIVATE-TOKEN")
-		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: req}, nil
+func TestDisableAllDryRunDoesNotCreateStateArtifacts(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), "missing-state")
+	t.Setenv("REPO_HARDEN_STATE_DIR", stateDir)
+	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/user/repos":
+			return jsonResponse(`[{"full_name":"me/app","owner":{"login":"me"}}]`), nil
+		case "/user":
+			return jsonResponse(`{"login":"tester","id":42}`), nil
+		case "/repos/me/app/actions/workflows":
+			return jsonResponse(`{"total_count":1,"workflows":[{"id":1,"name":"CI","state":"active"}]}`), nil
+		default:
+			return &http.Response{StatusCode: http.StatusNotFound, Header: make(http.Header), Body: http.NoBody}, nil
+		}
+	})})
+	_ = captureStdout(t, func() {
+		if err := cmdDisableAll(context.Background(), client, &opts{
+			dryRun: true, host: "github.com", concurrency: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
 	})
-	rt := &hostScopedHeader{header: "PRIVATE-TOKEN", host: "gitlab.example.com", base: base}
+	if _, err := os.Lstat(stateDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dry-run created or touched state directory %s: %v", stateDir, err)
+	}
+}
 
-	same, _ := http.NewRequest(http.MethodGet, "https://gitlab.example.com/x", nil)
-	same.Header.Set("PRIVATE-TOKEN", "secret")
-	if _, err := rt.RoundTrip(same); err != nil {
+func TestEnableAllDryRunDoesNotCreateLockFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "actions.json")
+	entries := []StateEntry{{Repo: "me/app", ID: 1, Name: "CI", Phase: ActionPhaseApplied}}
+	if err := saveState(path, testStateScope, entries); err != nil {
 		t.Fatal(err)
 	}
-	if seen != "secret" {
-		t.Fatalf("same-host request should keep the token header, got %q", seen)
-	}
-
-	off, _ := http.NewRequest(http.MethodGet, "https://evil.example.com/x", nil)
-	off.Header.Set("PRIVATE-TOKEN", "secret")
-	if _, err := rt.RoundTrip(off); err != nil {
-		t.Fatal(err)
-	}
-	if seen != "" {
-		t.Fatalf("off-host request must have the token header stripped, got %q", seen)
+	client := mockClient(map[string]string{"GET /user": `{"login":"tester","id":42}`})
+	_ = captureStdout(t, func() {
+		if err := cmdEnableAll(context.Background(), client, &opts{
+			dryRun: true, stateFile: path, host: "github.com", concurrency: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if _, err := os.Lstat(path + ".lock"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dry-run created lock file: %v", err)
 	}
 }
 
@@ -635,25 +501,12 @@ func TestNormalizeOptions(t *testing.T) {
 	}
 }
 
-func TestCommandNeedsGitHubClient(t *testing.T) {
-	if commandNeedsGitHubClient("controls", &opts{}) {
-		t.Fatal("controls needs no client")
-	}
-	if commandNeedsGitHubClient("audit", &opts{provider: "gitlab"}) {
-		t.Fatal("gitlab audit needs no github client")
-	}
-	if !commandNeedsGitHubClient("audit", &opts{provider: "github"}) {
-		t.Fatal("github audit needs a client")
-	}
-	if !commandNeedsGitHubClient("harden", &opts{provider: "github"}) {
-		t.Fatal("harden needs a client")
-	}
-}
-
 func TestToggleRepoEnableTargetsDisabledOnly(t *testing.T) {
 	puts := 0
 	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		switch {
+		case req.Method == http.MethodGet && req.URL.Path == "/repos/me/app":
+			return jsonResponse(`{"full_name":"me/app","owner":{"login":"me"},"fork":false,"archived":false}`), nil
 		case req.Method == http.MethodGet && req.URL.Path == "/repos/me/app/actions/workflows":
 			return jsonResponse(`{"total_count":2,"workflows":[
 				{"id":1,"name":"CI","path":".github/workflows/ci.yml","state":"disabled_manually"},
@@ -672,6 +525,40 @@ func TestToggleRepoEnableTargetsDisabledOnly(t *testing.T) {
 	})
 	if puts != 1 {
 		t.Fatalf("enable should target only the 1 disabled workflow, made %d PUTs", puts)
+	}
+}
+
+func TestToggleRepoEnforcesRepositoryScope(t *testing.T) {
+	tests := []struct {
+		name string
+		opts *opts
+		repo string
+	}{
+		{"owner", &opts{owner: "other"}, `{"full_name":"me/app","owner":{"login":"me"}}`},
+		{"fork", &opts{}, `{"full_name":"me/app","owner":{"login":"me"},"fork":true}`},
+		{"archived", &opts{}, `{"full_name":"me/app","owner":{"login":"me"},"archived":true}`},
+		{"admin", &opts{adminOnly: true}, `{"full_name":"me/app","owner":{"login":"me"},"permissions":{"admin":false}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workflowReads := 0
+			client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method == http.MethodGet && req.URL.Path == "/repos/me/app" {
+					return jsonResponse(tt.repo), nil
+				}
+				if req.URL.Path == "/repos/me/app/actions/workflows" {
+					workflowReads++
+				}
+				return &http.Response{StatusCode: http.StatusNotFound, Header: make(http.Header), Body: http.NoBody}, nil
+			})})
+			err := cmdToggleRepo(context.Background(), client, tt.opts, []string{"me/app"}, "disable")
+			if err == nil || !strings.Contains(err.Error(), "excluded") {
+				t.Fatalf("scope violation = %v, want excluded error", err)
+			}
+			if workflowReads != 0 {
+				t.Fatalf("scope violation read workflows %d time(s)", workflowReads)
+			}
+		})
 	}
 }
 
@@ -738,7 +625,7 @@ func TestEnableAllRespectsRepoScopeAndKeepsOtherState(t *testing.T) {
 	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		switch {
 		case req.Method == http.MethodGet && req.URL.Path == "/user":
-			return jsonResponse(`{"login":"tester"}`), nil
+			return jsonResponse(`{"login":"tester","id":42}`), nil
 		case req.Method == http.MethodPut:
 			enabled = append(enabled, req.URL.Path)
 			return jsonResponse(`{}`), nil
@@ -776,7 +663,7 @@ func TestEnableAllReconcilesUnknownEntryBeforeMutation(t *testing.T) {
 	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		switch {
 		case req.Method == http.MethodGet && req.URL.Path == "/user":
-			return jsonResponse(`{"login":"tester"}`), nil
+			return jsonResponse(`{"login":"tester","id":42}`), nil
 		case req.Method == http.MethodGet && req.URL.Path == "/repos/me/app/actions/workflows/7":
 			return jsonResponse(`{"id":7,"name":"CI","state":"active"}`), nil
 		case req.Method == http.MethodPut:

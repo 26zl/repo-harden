@@ -3,7 +3,7 @@
 > **Audit, harden, and manage your repositories — from one static binary.**
 > Read-only security posture across **GitHub, GitLab, Gitea & Forgejo** · reversible GitHub hardening · bulk GitHub Actions control.
 
-[![CI](https://github.com/26zl/repo-harden/actions/workflows/ci.yml/badge.svg)](https://github.com/26zl/repo-harden/actions/workflows/ci.yml) [![Go Reference](https://pkg.go.dev/badge/github.com/26zl/repo-harden.svg)](https://pkg.go.dev/github.com/26zl/repo-harden) ![Go 1.25.11+](https://img.shields.io/badge/Go-1.25.11%2B-00ADD8?logo=go&logoColor=white) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/26zl/repo-harden/actions/workflows/ci.yml/badge.svg)](https://github.com/26zl/repo-harden/actions/workflows/ci.yml) [![Go Reference](https://pkg.go.dev/badge/github.com/26zl/repo-harden.svg)](https://pkg.go.dev/github.com/26zl/repo-harden) ![Go 1.25.12+](https://img.shields.io/badge/Go-1.25.12%2B-00ADD8?logo=go&logoColor=white) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ```text
                        _                _
@@ -17,11 +17,11 @@
 
 Three things, no infrastructure — just a local binary and a token:
 
-- **Audit (read-only, multi-forge).** Scan your repos against a security baseline and get a posture score. Full catalog on **GitHub** (50+ checks); a portable subset on **GitLab, Gitea, and Forgejo**. Output as table, JSON, Markdown, or SARIF.
+- **Audit (read-only, multi-forge).** Scan your repos against a security baseline and get a posture score. Full catalog on **GitHub** (65+ checks, including workflow supply-chain, release provenance, runner hygiene, and cloud-OIDC trust); a portable subset — with pipeline supply-chain checks — on **GitLab, Gitea, and Forgejo**. Output as table, JSON, Markdown, SARIF, or a shields.io score badge, with OpenSSF Scorecard/SLSA/CIS framework references attached.
 - **Harden + revert (GitHub).** Apply the free security baseline — branch protection, read-only `GITHUB_TOKEN`, Dependabot, secret/code scanning — across every eligible repo at once. Host- and account-bound state records applied, pending, or ambiguous mutations so `revert` can restore verified changes safely. Forks and archived repos are skipped by default unless you opt in. 8 auto-fixable controls are reversible.
 - **Actions management (GitHub).** Bulk enable/disable Actions workflows — per repo or across eligible repos — when you hit free-minute limits, with saved state so you can restore.
 
-No GitHub App, no org-admin config repo, no Terraform, no standing access.
+No GitHub App, no org-admin config repo, no Terraform required, no standing access. (Moving to IaC anyway? `codify` emits the baseline as Terraform/OpenTofu HCL.)
 
 ## Quickstart
 
@@ -33,7 +33,7 @@ go install github.com/26zl/repo-harden/cmd/repo-harden@latest
 gh auth login
 
 # See where eligible repos stand (read-only) — works on GitLab/Gitea/Forgejo too
-repo-harden audit                          # every repo your token can reach
+repo-harden audit                          # eligible affiliated repos visible to the token
 repo-harden audit --repo me/app,me/lib     # just these — skips the full scan, much faster
 repo-harden audit --provider gitlab
 
@@ -45,17 +45,18 @@ repo-harden revert
 
 ## Commands
 
-**Security audit & hardening**
+### Security audit and hardening
 
 | Command | What it does |
 | --- | --- |
-| `audit` | Read-only posture scan. Multi-forge via `--provider`. `--format table\|json\|markdown\|sarif`, `--exit-code` for CI. |
+| `audit` | Read-only posture scan. Multi-forge via `--provider`. `--format table\|json\|markdown\|sarif\|badge`, `--exit-code`/`--fail-below`/`--diff` for CI. |
 | `harden` | Apply the auto-fixable baseline controls (8 of them) and save revert state first. GitHub only. `--dry-run`, `--only`/`--skip`. |
 | `revert` | Restore verified changes from host/account-bound recovery state. GitHub only. |
+| `codify` | Emit the provider-supported subset of the baseline as Terraform/OpenTofu HCL with import blocks. GitHub only. |
 | `controls` | List every baseline control and whether it is auto-fixable and reversible. Offline, no token. |
 | `version` / `help` | Print version and build info / show usage. Offline, no token. |
 
-**GitHub Actions management**
+### GitHub Actions management
 
 | Command | What it does |
 | --- | --- |
@@ -71,8 +72,8 @@ The read-only `audit` runs beyond GitHub — point it at another forge with `--p
 | Provider | Audit | Harden / Actions |
 | --- | :---: | :---: |
 | GitHub / GHES | ✅ full catalog | ✅ |
-| GitLab | ✅ portable subset | — |
-| Gitea / Forgejo | ✅ portable subset | — |
+| GitLab | ✅ portable subset + `pipeline-supply-chain` (unpinned images, floating includes) | — |
+| Gitea / Forgejo | ✅ portable subset + the workflow supply-chain checks (`.gitea`, `.forgejo`, and `.github` workflow dirs) | — |
 
 ```bash
 repo-harden audit --provider gitlab                      # uses GITLAB_TOKEN
@@ -81,19 +82,43 @@ repo-harden audit --provider gitea --host git.example.com # uses GITEA_TOKEN
 
 `harden`/`revert` and the Actions commands are GitHub-only by design: branch protection ports across forges, but the high-value scanning controls are GitHub-proprietary (or GitLab paid-tier), so a cross-forge `harden` would be mostly no-ops. `audit` gives the cross-forge visibility that matters.
 
+## Codify: from click-ops to IaC
+
+`codify` emits the provider-supported baseline as Terraform/OpenTofu HCL with
+import blocks for settings that already exist:
+
+```bash
+repo-harden codify --repo me/app > baseline.tf
+terraform init && terraform plan   # the plan IS your posture gap; apply = harden via IaC
+```
+
+Review the first plan: importing adopts existing resources but does not promise
+a no-op. Controls without dedicated provider resources remain with `harden`.
+`codify` fails instead of guessing when existing policy cannot be inspected or
+would be overwritten.
+
 ## What the audit checks
 
-A **best-effort baseline**, not an exhaustive security review (see [Not yet covered](#not-yet-covered)). On GitHub it runs 50+ checks; license-gated or inaccessible features are reported as `skipped` rather than guessed. Output includes a severity-weighted verification percentage alongside the posture score. Use `--fail-on-skipped` when an unverifiable check must fail CI.
+A best-effort baseline, not an exhaustive security review. GitHub gets the full
+catalog; GitLab, Gitea, and Forgejo get the portable subset. Inaccessible or
+license-gated checks are `skipped`, never guessed. Use `--fail-on-skipped` when
+unverifiable results must fail CI.
 
-**Auto-fixable by `harden` (8 reversible controls):** Dependabot alerts + security updates · read-only `GITHUB_TOKEN` (and barred from approving PRs) · default-branch ruleset (required PR review, conversation resolution, no force-push, linear history) · Actions set to selected GitHub-owned + verified actions (this clears any custom allowlist patterns — audit flags them for manual review first, and `revert` restores them) · secret scanning + push protection · CodeQL default setup · private vulnerability reporting.
+`harden` applies eight reversible GitHub controls: Dependabot alerts and
+security updates, least-privilege workflow tokens, a default-branch ruleset, a
+restricted Actions policy, secret scanning and push protection, CodeQL default
+setup, and private vulnerability reporting.
 
-**Read-only audit also covers (examples):** branch-protection depth (review count, status checks, signed commits), ruleset bypass actors, **evaluate-only (dry-run) rulesets** that enforce nothing, **conflicting code-scanning setups** (default setup vs. an advanced workflow), **per-workflow GITHUB_TOKEN permissions** (least-privilege), Actions SHA-pinning policy, account & org 2FA, **community health files** (issue/PR templates, CoC, contributing), outside collaborators, merge-method & fork policy, public-wiki surface, collaborator & admin hygiene, webhook TLS/staleness, deploy keys, environments, fork-PR approval, public exposure, SBOM/dependency inventory, plus org-level Actions/token/secret/webhook policy.
+The read-only catalog also covers workflow supply-chain risks, OIDC trust,
+release provenance, runner exposure, tag protection, organization policy,
+collaborator and webhook hygiene, repository exposure, declared repository
+licenses, community files, and dependency inventory. JSON, SARIF, and Markdown rows include best-effort
+OpenSSF Scorecard, SLSA, and CIS Software Supply Chain Security references.
 
 Two baseline controls — `SECURITY.md` and `CODEOWNERS` — are report-only: flagged by `audit` and listed by `controls`, but never auto-edited.
 
-### Not yet covered
-
-Known gaps (contributions welcome): dependency-review enforcement, merge queues, deeper ruleset validation for required status checks and code-owner review, artifact/SBOM attestation auditing, Dependabot private-registry secrets, self-hosted runner policy, and webhook/environment secret hygiene.
+Known gaps include full cryptographic statement verification, Dependabot
+private-registry secrets, and webhook/environment secret hygiene.
 
 ## Reversibility & state
 
@@ -104,9 +129,14 @@ $REPO_HARDEN_STATE_DIR/harden-state.json   # if REPO_HARDEN_STATE_DIR is set
 ~/.repo-harden/harden-state.json           # default
 ```
 
-`revert` reads this file and restores changes that were recorded as applied. It re-detects every live setting first, including entries marked `applied`, and refuses to overwrite settings that have drifted since `harden`. If an API call fails ambiguously, the entry remains `pending`/`unknown`; controls that were already compliant are never recorded.
+`revert` reads this file and restores changes that were recorded as applied. It
+re-detects live settings, refuses to overwrite drift, and verifies each result.
+Ambiguous outcomes remain `pending`/`unknown`; settings the tool did not change
+are never reverted.
 
-State files are versioned and bound to the GitHub host and authenticated account, so unbound legacy files and cross-host or cross-account replays are rejected.
+State schema 2 binds files to the provider, normalized host, and stable account
+ID. Cross-host, cross-account, wrong-kind, and unbound legacy files are
+rejected. Matching schema-1 files are upgraded on the next state-changing save.
 
 Actions bulk-disable uses a separate state file:
 
@@ -115,47 +145,92 @@ $REPO_HARDEN_STATE_DIR/enabled-workflows.json
 ~/.repo-harden/enabled-workflows.json
 ```
 
-Use `--state-file <path>` to override the state path for the command you are running. Give each command family its own path: `harden`/`revert` and the Actions commands use different file formats, so pointing both at the same `--state-file` is rejected rather than silently overwriting one with the other.
+Use `--state-file <path>` to override a path. Hardening and Actions state are
+different kinds and cannot share a file. Dry runs may read existing state but
+do not create directories or locks, write state, or mutate a forge.
 
 ## CI usage
 
 ```bash
-repo-harden audit --exit-code                 # fail the job on any gap or error
+repo-harden audit --exit-code                 # fail the job on any gap or error (info-severity gaps don't count)
 repo-harden audit --exit-code --fail-on-skipped # strict: also fail if a check is unverifiable
+repo-harden audit --fail-below 80             # posture-score gate instead of any-gap
 repo-harden audit --format sarif > out.sarif  # for GitHub code-scanning ingestion
+repo-harden audit --format badge > badge.json # shields.io endpoint JSON for a README badge
+
+# Drift gate: fail only when posture REGRESSES, not on known accepted gaps
+repo-harden audit --format json > today.json
+repo-harden audit --diff yesterday.json --exit-code
 ```
+
+### Audit JSON contract
+
+`audit --format json` emits a versioned `repo-harden-audit` envelope. Consumers
+must check `version` and `kind`; the published
+[JSON Schema](audit-report.schema.json) is the machine-readable contract
+and is included in binary release archives. A minimal report looks like this:
+
+```json
+{
+  "version": 1,
+  "kind": "repo-harden-audit",
+  "scope": {
+    "provider": "github",
+    "host": "github.com",
+    "owner": "acme",
+    "repositories": ["acme/app"],
+    "controls": ["public-exposure"],
+    "selection": {
+      "requested_repositories": [],
+      "include_forks": false,
+      "include_archived": false,
+      "admin_only": false,
+      "include_dynamic": false,
+      "organization_audit": true,
+      "stale_days": 180
+    }
+  },
+  "repository_count": 1,
+  "rows": [
+    {
+      "provider": "github",
+      "scope": "repo",
+      "repo": "acme/app",
+      "control": "public-exposure",
+      "status": "compliant"
+    }
+  ]
+}
+```
+
+Diff baselines are scope-bound: provider, normalized host, owner, selection,
+repository universe, and control universe must still match. Missing rows, new
+unverifiable rows, transitions to `skipped`, and new non-info gaps or errors are
+regressions. `--exit-code` turns them into a failing exit; `--fail-on-skipped`
+and `--fail-below` remain independent gates. The posture score behind
+`--fail-below` counts info-severity rows at minimal weight, so it can react to
+advisory findings that `--exit-code` ignores. Unknown fields and unsupported
+versions are rejected.
+
+Legacy top-level row arrays can be inspected during migration, but they cannot
+prove host or owner scope. They warn and always fail with `--exit-code` until a
+new versioned baseline replaces them. Incompatible contract or drift-semantics
+changes require a new report version.
 
 ## Flags
 
-| Flag | Description |
-| --- | --- |
-| `--provider <name>` | `github` (default), `gitlab`, `gitea`, `forgejo` (audit) |
-| `--host <host-or-url>` | Provider host (GHES, GitLab, Gitea/Forgejo); accepts the web root or the API URL. Gitea/Forgejo default to `http://localhost:3000` |
-| `--token <token>` | Provider token (discouraged — visible in `ps`/shell history; prefer env vars, `gh auth`, or `--token-stdin`) |
-| `--token-stdin` | Read the provider token from stdin |
-| `--dry-run` | Perform read-only detection and print intended mutations; API read calls still occur |
-| `--owner <login>` | Only touch repos owned by this user/org |
-| `--repo <owner/repo>` | Only these repos (comma-separated); fetches them directly and skips the full account scan. Owner/admin/fork/archive filters still apply. |
-| `--admin-only` | Only include repos where your token has admin permission |
-| `--only <keys>` / `--skip <keys>` | Run / skip specific controls (comma-separated keys) |
-| `--format <fmt>` | `table` (default), `json`, `markdown`, `sarif` |
-| `--all` | Audit table shows only gaps/errors by default; `--all` shows every check (compliant/skipped too) |
-| `--json` | Shortcut for JSON output on `list`, `status`, and `audit` |
-| `--exit-code` | Exit non-zero when `audit` finds a gap or error |
-| `--fail-on-skipped` | Exit non-zero when any audit check is skipped/unverifiable |
-| `--color <when>` / `--no-color` | `auto` (default), `always`, `never`; respects `NO_COLOR` |
-| `--concurrency <n>` | Parallel API calls (default: 8) |
-| `--include-forks` / `--include-archived` | Include forked / archived repos (skipped by default) |
-| `--include-dynamic` | Include dynamic Actions workflows that are skipped by default |
-| `--org-audit` | Include GitHub organization-level audit checks (default; use `--org-audit=false` to disable) |
-| `--stale-days <n>` | Stale repository threshold (default: 180) |
-| `--state-file <path>` | Override the default state file path |
-| `--show-identifiers` | Include secret/CI-variable names, collaborator usernames, and deploy-key titles in audit output (hidden by default) |
+Run `repo-harden help` or `repo-harden <command> --help` for the complete flag
+reference. Common selectors are `--provider`, `--host`, `--owner`, `--repo`,
+`--only`, and `--skip`. Mutation commands support `--dry-run`; audit gates use
+`--exit-code`, `--fail-on-skipped`, `--fail-below`, and
+[`--diff`](#audit-json-contract). Prefer environment tokens, `gh auth`, or
+`--token-stdin` because `--token` can be exposed in process listings and shell
+history.
 
 ## Requirements & install
 
-- Go 1.25.11+ (the `go.mod` toolchain pin; with the default `GOTOOLCHAIN=auto` the right toolchain is fetched automatically)
-- A token for the forge you target: [`gh`](https://cli.github.com/) logged in (`gh auth login`) or `GITHUB_TOKEN`; `GITLAB_TOKEN` / `GITEA_TOKEN` / `FORGEJO_TOKEN` for those providers
+- Go 1.25.12+ (declared in `go.mod`; with the default `GOTOOLCHAIN=auto` the right toolchain is fetched automatically)
+- A token for the forge you target: [`gh`](https://cli.github.com/) logged in (`gh auth login`) or `GITHUB_TOKEN`; `GITLAB_TOKEN` / `GITEA_TOKEN` / `FORGEJO_TOKEN` (Forgejo falls back to `GITEA_TOKEN`) for those providers
 
 Use the least-privilege token that covers the commands you run:
 
@@ -176,48 +251,44 @@ go install github.com/26zl/repo-harden/cmd/repo-harden@latest
 go build -o repo-harden ./cmd/repo-harden
 ```
 
-## How it compares
-
-| | repo-harden | Scorecard / Legitify | Allstar / safe-settings | Terraform GH provider |
-| --- | :---: | :---: | :---: | :---: |
-| Reports gaps | ✅ | ✅ | ✅ | n/a |
-| **Applies the fix** | **✅** | ❌ | ✅ | ✅ |
-| Reversible (one command) | **✅** | n/a | partial | via state |
-| Multi-forge audit | **✅** | partial | ❌ | ❌ |
-| Infra required | **none** | none | App + config repo | IaC + state backend |
-| Single binary | **✅** | mixed | ❌ | ❌ |
-
 ## Background
 
-repo-harden started as a hobby project — a tool I built for my own repositories because I wanted one command to audit and harden them, without installing an app or standing up infrastructure. It turned out useful enough that I'm opening it up publicly in case it helps others.
+repo-harden started as a hobby project — a tool I built for my own repositories
+because I wanted one command to audit and harden them, without installing an
+app or standing up infrastructure. It turned out useful enough that I opened it
+up publicly in case it helps others.
 
 ## Production operations
 
-Before tagging a release:
+Changes to `main` go through pull requests. The branch ruleset blocks direct,
+deleting, and non-fast-forward updates and requires the CI, cross-platform,
+dependency-review, and CodeQL checks to pass.
+Require a green latest `main` run before tagging a release.
 
-1. Confirm the protected `main` commit has passed CI and CodeQL.
-2. Verify the branch/tag rulesets, restricted Actions policy, read-only
-   `GITHUB_TOKEN`, secret scanning, push protection, and private vulnerability
-   reporting in GitHub.
-3. Run read-only audit smoke tests against disposable GitHub.com, GHES, GitLab,
-   Gitea, and Forgejo projects. On GitHub.com, also exercise `harden --dry-run`,
-   apply, and `revert` while checking state recovery after a partial failure.
-4. Verify the release contains Linux, macOS, and Windows archives, checksums,
-   per-archive SBOMs, and build-provenance attestations. Install and smoke-test
-   one archive on each supported operating-system family.
+The CLI's `branch-protection` hardening control can establish the structural
+pull-request safeguards. Repository-specific status-check names and signed
+commit enforcement must also be configured in the GitHub branch ruleset by
+hand.
 
-Provider smoke tests require external instances and credentials and therefore
-cannot be verified by pull-request CI alone.
+Before a production release, verify the GitHub-side settings that repository
+files cannot enforce: protect `main` with pull requests and the documented
+checks, protect `v*` tags, enable immutable releases, restrict Actions and the
+default workflow token, and require approval for the `release` and `acceptance`
+environments.
+
+Before the first production release, run the manual
+[acceptance workflow](https://github.com/26zl/repo-harden/actions/workflows/acceptance.yml) against disposable
+instances for each claimed provider, then publish a prerelease and verify all
+archives, checksums, SBOMs, attestations, native smoke tests, and environment
+approval. External-provider behavior cannot be proven by CI mocks alone.
 
 ## Contributing
 
-```bash
-go test ./...
-go vet ./...
-```
-
-Controls live in `internal/repoharden/controls.go` (baseline, auto-fixable) and `internal/repoharden/audit_github.go` (read-only audit catalog); other-forge audits are in `internal/repoharden/audit_providers.go`. Each baseline control is a `Control{Detect, Apply, Revert}` — a good first contribution is adding a new check. Issues and PRs welcome.
+See
+[CONTRIBUTING.md](https://github.com/26zl/repo-harden/blob/main/CONTRIBUTING.md)
+for the local checks and change-specific test expectations.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). Binary release archives also include the consolidated
+[third-party licenses and notices](THIRD_PARTY_LICENSES.txt).

@@ -11,40 +11,84 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: "1.15.8"
+          terraform_wrapper: false
       - name: gofmt
         run: |
           unformatted=$(gofmt -l .)
           test -z "$unformatted" || { echo "needs gofmt:"; echo "$unformatted"; exit 1; }
+      - name: go module consistency
+        run: |
+          go mod verify
+          go mod tidy -diff
       - name: go vet
         run: go vet ./...
       - name: build
         run: go build ./...
-      - name: test (race + coverage)
+      - name: test (race + coverage + Terraform fixture)
+        env:
+          REPO_HARDEN_TERRAFORM_TEST: "1"
         run: |
           go test -race -coverprofile=coverage.out ./...
           total=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%", "", $3); print $3}')
-          awk -v total="$total" 'BEGIN { if (total < 55.0) { printf "coverage %.1f%% is below 55.0%%\n", total; exit 1 } }'
+          awk -v total="$total" 'BEGIN { if (total < 70.0) { printf "coverage %.1f%% is below 70.0%%\n", total; exit 1 } }'
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.5.0 ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
       - name: staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
       - name: actionlint
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
-      - uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
+      - name: third-party license policy
+        run: |
+          go run github.com/google/go-licenses@v1.6.0 check \
+            --allowed_licenses=Apache-2.0,BSD-2-Clause,BSD-3-Clause,MIT \
+            ./cmd/repo-harden
+          runtime_modules=$(go list -deps \
+            -f '{{with .Module}}{{if not .Main}}{{.Path}} {{.Version}}{{end}}{{end}}' \
+            ./cmd/repo-harden | sed '/^$/d' | sort -u)
+          while read -r module version; do
+            grep -Fq "$module $version" THIRD_PARTY_LICENSES.txt || {
+              echo "THIRD_PARTY_LICENSES.txt is missing runtime module $module $version" >&2
+              exit 1
+            }
+          done <<< "$runtime_modules"
+          go_version=$(go env GOVERSION)
+          grep -Fq "Go standard library ${go_version#go}" THIRD_PARTY_LICENSES.txt
+      - name: Install immutable Syft release
+        env:
+          SYFT_VERSION: "1.46.0"
+          SYFT_SHA256: "d654f678b709eb53c393d38519d5ed7d2e57205529404018614cfefa0fb2b5ca"
+        run: |
+          archive="$RUNNER_TEMP/syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz" \
+            --output "$archive"
+          echo "$SYFT_SHA256  $archive" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/syft-bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/syft-bin" syft
+          echo "$RUNNER_TEMP/syft-bin" >> "$GITHUB_PATH"
       - name: GoReleaser snapshot
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
-          version: "2.16.0"
+          version: "2.17.0"
           args: release --snapshot --clean
 
   # Exercise state-file behavior on every supported operating system.
@@ -57,6 +101,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod

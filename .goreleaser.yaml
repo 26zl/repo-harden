@@ -20,14 +20,25 @@ builds:
 
 archives:
   - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     format_overrides:
       - goos: windows
         formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+      - THIRD_PARTY_LICENSES.txt
+      - audit-report.schema.json
 
 checksum:
   name_template: checksums.txt
 
 sboms:
   - artifacts: archive
+    cmd: bash
+    args: ["../scripts/generate-sbom.sh", "$artifact", "$document"]
+    env:
+      - REPO_HARDEN_SBOM_CREATED={{ .CommitDate }}
+      - SYFT_FILE_METADATA_CATALOGER_ENABLED=true
     documents:
       - "${artifact}.sbom.json"

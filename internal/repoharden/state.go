@@ -12,12 +12,16 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gofrs/flock"
 	"github.com/google/go-github/v88/github"
 )
 
-const stateSchemaVersion = 1
+const (
+	stateSchemaVersion       = 2
+	legacyStateSchemaVersion = 1
+)
 
 const (
 	actionsStateKind = "actions-workflows"
@@ -25,12 +29,13 @@ const (
 )
 
 type StateScope struct {
-	Provider string `json:"provider"`
-	Host     string `json:"host"`
-	Account  string `json:"account"`
+	Provider  string `json:"provider"`
+	Host      string `json:"host"`
+	Account   string `json:"account"`
+	AccountID int64  `json:"account_id,omitempty"`
 }
 
-// StateEntry is one workflow disable-all turned off.
+// StateEntry records one workflow that disable-all turned off.
 type StateEntry struct {
 	Repo  string      `json:"repo"`
 	ID    int64       `json:"id"`
@@ -102,7 +107,11 @@ func githubStateScope(ctx context.Context, c *github.Client, o *opts) (StateScop
 	if account == "" {
 		return StateScope{}, errors.New("authenticated GitHub account has an empty login")
 	}
-	return StateScope{Provider: "github", Host: host, Account: account}, nil
+	accountID := user.GetID()
+	if accountID <= 0 {
+		return StateScope{}, errors.New("authenticated GitHub account has no stable account ID")
+	}
+	return StateScope{Provider: "github", Host: host, Account: account, AccountID: accountID}, nil
 }
 
 func normalizeStateScope(scope StateScope) StateScope {
@@ -118,11 +127,19 @@ func validateStateScope(actual, expected StateScope) error {
 	if actual.Provider == "" || actual.Host == "" || actual.Account == "" {
 		return errors.New("state scope is incomplete")
 	}
-	if actual != expected {
+	providerHostMatch := actual.Provider == expected.Provider && actual.Host == expected.Host
+	accountMatch := false
+	if actual.AccountID > 0 {
+		accountMatch = expected.AccountID > 0 && actual.AccountID == expected.AccountID
+	} else {
+		// Version-1 state has no stable ID, so login match is the only safe migration path.
+		accountMatch = strings.EqualFold(actual.Account, expected.Account)
+	}
+	if !providerHostMatch || !accountMatch {
 		return fmt.Errorf(
-			"state belongs to %s account %s at %s, current target is %s account %s at %s",
-			actual.Provider, actual.Account, actual.Host,
-			expected.Provider, expected.Account, expected.Host,
+			"state belongs to %s account %s (id %d) at %s, current target is %s account %s (id %d) at %s",
+			actual.Provider, actual.Account, actual.AccountID, actual.Host,
+			expected.Provider, expected.Account, expected.AccountID, expected.Host,
 		)
 	}
 	return nil
@@ -159,10 +176,10 @@ func decodeStateEnvelope[T any](path, kind string, scope StateScope) (stateEnvel
 	if err := ensureJSONEOF(dec); err != nil {
 		return stateEnvelope[T]{}, fmt.Errorf("parse state file %s: %w", path, err)
 	}
-	if out.Version != stateSchemaVersion {
+	if out.Version != stateSchemaVersion && out.Version != legacyStateSchemaVersion {
 		return stateEnvelope[T]{}, fmt.Errorf(
-			"unsupported state schema version %d in %s (expected %d)",
-			out.Version, path, stateSchemaVersion,
+			"unsupported state schema version %d in %s (expected %d or legacy %d)",
+			out.Version, path, stateSchemaVersion, legacyStateSchemaVersion,
 		)
 	}
 	if out.Kind != kind {
@@ -174,6 +191,9 @@ func decodeStateEnvelope[T any](path, kind string, scope StateScope) (stateEnvel
 	if err := validateStateScope(out.Scope, scope); err != nil {
 		return stateEnvelope[T]{}, fmt.Errorf("refusing state file %s: %w", path, err)
 	}
+	// Normalize legacy state in memory; the next state-changing save persists version 2.
+	out.Version = stateSchemaVersion
+	out.Scope = normalizeStateScope(scope)
 	if out.Entries == nil {
 		out.Entries = []T{}
 	}
@@ -192,10 +212,14 @@ func ensureJSONEOF(dec *json.Decoder) error {
 }
 
 func saveStateEnvelope[T any](path, kind string, scope StateScope, entries []T) error {
+	scope = normalizeStateScope(scope)
+	if scope.Provider == "" || scope.Host == "" || scope.Account == "" || scope.AccountID <= 0 {
+		return errors.New("state scope must include provider, host, account, and a stable account ID")
+	}
 	out := stateEnvelope[T]{
 		Version: stateSchemaVersion,
 		Kind:    kind,
-		Scope:   normalizeStateScope(scope),
+		Scope:   scope,
 		Entries: entries,
 	}
 	b, err := json.MarshalIndent(out, "", "  ")
@@ -280,7 +304,9 @@ func validateRepoSlug(repo string) error {
 		return fmt.Errorf("invalid repository name %q", repo)
 	}
 	owner, name := splitRepo(repo)
-	if owner == "" || name == "" || strings.ContainsAny(repo, "\x00\r\n\t") {
+	if owner == "" || name == "" || strings.ContainsFunc(repo, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.Is(unicode.Cf, r)
+	}) {
 		return fmt.Errorf("invalid repository name %q", repo)
 	}
 	return nil
@@ -341,7 +367,7 @@ func validateHardenEntries(entries []HardenEntry) error {
 	return nil
 }
 
-func stateDir() (string, error) {
+func stateDirPath(create bool) (string, error) {
 	dir := strings.TrimSpace(os.Getenv("REPO_HARDEN_STATE_DIR"))
 	managedDefault := dir == ""
 	if managedDefault {
@@ -361,13 +387,15 @@ func stateDir() (string, error) {
 			return "", fmt.Errorf("state directory path is not a directory: %s", dir)
 		}
 	case errors.Is(err, os.ErrNotExist):
-		if err := os.MkdirAll(dir, 0o700); err != nil { // #nosec G703 -- create the validated operator-selected state directory.
-			return "", err
+		if create {
+			if err := os.MkdirAll(dir, 0o700); err != nil { // #nosec G703 -- create the validated operator-selected state directory.
+				return "", err
+			}
 		}
 	default:
 		return "", err
 	}
-	if managedDefault {
+	if managedDefault && create {
 		if err := os.Chmod(dir, 0o700); err != nil { // #nosec G302,G703 -- 0700 is correct for the tool-owned default directory.
 			return "", err
 		}
@@ -375,9 +403,11 @@ func stateDir() (string, error) {
 	return dir, nil
 }
 
-func customStateFilePath(o *opts) (string, bool, error) {
+func stateDir() (string, error) { return stateDirPath(true) }
+
+func customStateFilePath(o *opts, create bool) (string, bool, error) {
 	if o != nil && o.stateFile != "" {
-		if dir := filepath.Dir(o.stateFile); dir != "" && dir != "." {
+		if dir := filepath.Dir(o.stateFile); create && dir != "" && dir != "." {
 			if err := os.MkdirAll(dir, 0o700); err != nil {
 				return "", false, err
 			}
@@ -387,26 +417,36 @@ func customStateFilePath(o *opts) (string, bool, error) {
 	return "", false, nil
 }
 
-func stateFilePath(o *opts) (string, error) {
-	if path, ok, err := customStateFilePath(o); ok || err != nil {
+func stateFilePathMode(o *opts, create bool) (string, error) {
+	if path, ok, err := customStateFilePath(o, create); ok || err != nil {
 		return path, err
 	}
-	dir, err := stateDir()
+	dir, err := stateDirPath(create)
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(dir, "enabled-workflows.json"), nil
 }
 
-func hardenStateFilePath(o *opts) (string, error) {
-	if path, ok, err := customStateFilePath(o); ok || err != nil {
+func stateFilePath(o *opts) (string, error) { return stateFilePathMode(o, true) }
+
+func stateFilePathReadOnly(o *opts) (string, error) { return stateFilePathMode(o, false) }
+
+func hardenStateFilePathMode(o *opts, create bool) (string, error) {
+	if path, ok, err := customStateFilePath(o, create); ok || err != nil {
 		return path, err
 	}
-	dir, err := stateDir()
+	dir, err := stateDirPath(create)
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(dir, "harden-state.json"), nil
+}
+
+func hardenStateFilePath(o *opts) (string, error) { return hardenStateFilePathMode(o, true) }
+
+func hardenStateFilePathReadOnly(o *opts) (string, error) {
+	return hardenStateFilePathMode(o, false)
 }
 
 func entryKey(repo string, id int64) string { return fmt.Sprintf("%s#%d", repo, id) }

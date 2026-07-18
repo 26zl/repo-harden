@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/26zl/repo-harden/main/audit-report.schema.json",
+  "title": "repo-harden audit report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "kind", "scope", "repository_count", "rows"],
+  "properties": {
+    "version": { "const": 1 },
+    "kind": { "const": "repo-harden-audit" },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "host", "repositories", "controls", "selection"],
+      "properties": {
+        "provider": {
+          "enum": ["github", "gitlab", "gitea", "forgejo"]
+        },
+        "host": { "type": "string", "minLength": 1 },
+        "owner": { "type": "string" },
+        "repositories": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "controls": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "requested_repositories",
+            "include_forks",
+            "include_archived",
+            "admin_only",
+            "include_dynamic",
+            "organization_audit",
+            "stale_days"
+          ],
+          "properties": {
+            "requested_repositories": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "uniqueItems": true
+            },
+            "include_forks": { "type": "boolean" },
+            "include_archived": { "type": "boolean" },
+            "admin_only": { "type": "boolean" },
+            "include_dynamic": { "type": "boolean" },
+            "organization_audit": { "type": "boolean" },
+            "stale_days": { "type": "integer", "minimum": 1, "maximum": 36500 }
+          }
+        }
+      }
+    },
+    "repository_count": { "type": "integer", "minimum": 0 },
+    "rows": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/auditRow" }
+    }
+  },
+  "$defs": {
+    "auditRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo", "control", "status"],
+      "properties": {
+        "provider": {
+          "enum": ["github", "gitlab", "gitea", "forgejo"]
+        },
+        "scope": { "enum": ["repo", "org", "token"] },
+        "repo": { "type": "string", "minLength": 1 },
+        "control": { "type": "string", "minLength": 1 },
+        "title": { "type": "string" },
+        "severity": {
+          "enum": ["critical", "high", "medium", "low", "info"]
+        },
+        "status": {
+          "enum": ["compliant", "gap", "skipped", "error"]
+        },
+        "detail": { "type": "string" },
+        "remediation": { "type": "string" },
+        "refs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,125 @@
+name: Acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: Forge to test
+        required: true
+        type: choice
+        options: [github, gitlab, gitea, forgejo]
+      host:
+        description: Forge host or URL
+        required: true
+        type: string
+        default: github.com
+      owner:
+        description: Disposable owner/group to audit
+        required: true
+        type: string
+      repository:
+        description: Disposable owner/repo (required for GitHub)
+        required: false
+        type: string
+      apply_and_revert:
+        description: Exercise GitHub harden and revert after dry-run
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: acceptance
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build exact workflow commit
+        run: go build -trimpath -o "$RUNNER_TEMP/repo-harden" ./cmd/repo-harden
+      - name: Full observational provider audit
+        env:
+          PROVIDER: ${{ inputs.provider }}
+          HOST: ${{ inputs.host }}
+          OWNER: ${{ inputs.owner }}
+          REPOSITORY: ${{ inputs.repository }}
+          TOKEN: ${{ inputs.provider == 'github' && secrets.ACCEPTANCE_GITHUB_TOKEN || inputs.provider == 'gitlab' && secrets.ACCEPTANCE_GITLAB_TOKEN || inputs.provider == 'gitea' && secrets.ACCEPTANCE_GITEA_TOKEN || inputs.provider == 'forgejo' && secrets.ACCEPTANCE_FORGEJO_TOKEN }}
+        run: |
+          case "$PROVIDER" in
+            github|gitlab|gitea|forgejo) ;;
+            *) echo "unsupported provider" >&2; exit 2 ;;
+          esac
+          test -n "$TOKEN" && test "$TOKEN" != "false"
+          args=(audit --provider "$PROVIDER" --host "$HOST" --owner "$OWNER" --all --token-stdin)
+          if test "$PROVIDER" = github; then
+            test -n "$REPOSITORY"
+            args+=(--repo "$REPOSITORY" --org-audit=false)
+          fi
+          printf '%s' "$TOKEN" | "$RUNNER_TEMP/repo-harden" "${args[@]}"
+      - name: Provider-portable verification gate
+        env:
+          PROVIDER: ${{ inputs.provider }}
+          HOST: ${{ inputs.host }}
+          OWNER: ${{ inputs.owner }}
+          REPOSITORY: ${{ inputs.repository }}
+          TOKEN: ${{ inputs.provider == 'github' && secrets.ACCEPTANCE_GITHUB_TOKEN || inputs.provider == 'gitlab' && secrets.ACCEPTANCE_GITLAB_TOKEN || inputs.provider == 'gitea' && secrets.ACCEPTANCE_GITEA_TOKEN || inputs.provider == 'forgejo' && secrets.ACCEPTANCE_FORGEJO_TOKEN }}
+        run: |
+          case "$PROVIDER" in
+            github|gitlab|gitea|forgejo) ;;
+            *) echo "unsupported provider" >&2; exit 2 ;;
+          esac
+          test -n "$TOKEN" && test "$TOKEN" != "false"
+          args=(audit --provider "$PROVIDER" --host "$HOST" --owner "$OWNER" \
+            --only "public-exposure,default-branch" --exit-code --fail-on-skipped --token-stdin)
+          if test "$PROVIDER" = github; then
+            test -n "$REPOSITORY"
+            args+=(--repo "$REPOSITORY" --org-audit=false)
+          fi
+          printf '%s' "$TOKEN" | "$RUNNER_TEMP/repo-harden" "${args[@]}"
+      - name: GitHub harden dry-run
+        if: inputs.provider == 'github'
+        env:
+          HOST: ${{ inputs.host }}
+          REPOSITORY: ${{ inputs.repository }}
+          TOKEN: ${{ secrets.ACCEPTANCE_GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$TOKEN" | "$RUNNER_TEMP/repo-harden" harden \
+            --host "$HOST" --repo "$REPOSITORY" --dry-run --token-stdin
+      - name: GitHub apply and verified revert
+        if: inputs.provider == 'github' && inputs.apply_and_revert
+        env:
+          HOST: ${{ inputs.host }}
+          REPOSITORY: ${{ inputs.repository }}
+          TOKEN: ${{ secrets.ACCEPTANCE_GITHUB_TOKEN }}
+          REPO_HARDEN_STATE_DIR: ${{ runner.temp }}/repo-harden-state
+        run: |
+          state_file="$REPO_HARDEN_STATE_DIR/harden-state.json"
+          cleanup() {
+            command_status=$?
+            trap - EXIT
+            state_status=0
+            if test ! -s "$state_file"; then
+              echo "::error::harden did not create a non-empty state file"
+              state_status=1
+            fi
+            revert_status=0
+            printf '%s' "$TOKEN" | "$RUNNER_TEMP/repo-harden" revert \
+              --host "$HOST" --repo "$REPOSITORY" --token-stdin || revert_status=$?
+            if test "$revert_status" -ne 0; then
+              echo "::error::cleanup revert failed with status $revert_status"
+            fi
+            if test "$command_status" -ne 0 || test "$state_status" -ne 0 || test "$revert_status" -ne 0; then
+              exit 1
+            fi
+          }
+          trap cleanup EXIT
+          printf '%s' "$TOKEN" | "$RUNNER_TEMP/repo-harden" harden \
+            --host "$HOST" --repo "$REPOSITORY" --token-stdin

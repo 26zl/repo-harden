@@ -7,12 +7,28 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/google/go-github/v88/github"
 	"gopkg.in/yaml.v3"
 )
 
-func auditGitHubCodeScanningConflict(ctx context.Context, c *github.Client, owner, name string, repo *github.Repository) auditRow {
+// workflowFileCache lazily shares one .github/workflows fetch per repository
+// across all workflow-file-based checks.
+type workflowFileCache struct {
+	once  sync.Once
+	files map[string]string
+	err   error
+}
+
+func (wc *workflowFileCache) get(ctx context.Context, c *github.Client, owner, name, branch string) (map[string]string, error) {
+	wc.once.Do(func() {
+		wc.files, wc.err = listWorkflowFiles(ctx, c, owner, name, branch)
+	})
+	return wc.files, wc.err
+}
+
+func auditGitHubCodeScanningConflict(ctx context.Context, c *github.Client, owner, name string, repo *github.Repository, wc *workflowFileCache) auditRow {
 	const (
 		key   = "code-scanning-conflict"
 		title = "No conflicting code-scanning setups"
@@ -28,11 +44,15 @@ func auditGitHubCodeScanningConflict(ctx context.Context, c *github.Client, owne
 	if cfg.GetState() != "configured" {
 		return githubAuditRow(repo, key, title, "medium", StatusCompliant, "default setup not enabled (no conflict possible)", rem)
 	}
-	uses, err := workflowsUsingCodeQL(ctx, c, owner, name, repo.GetDefaultBranch())
+	files, err := wc.get(ctx, c, owner, name, repo.GetDefaultBranch())
 	if err != nil {
 		if endpointUnavailable(err) {
 			return githubAuditRow(repo, key, title, "medium", StatusSkipped, "default setup on; workflows not readable", rem)
 		}
+		return githubAuditRow(repo, key, title, "medium", StatusError, err.Error(), rem)
+	}
+	uses, err := workflowsUsingCodeQL(files)
+	if err != nil {
 		return githubAuditRow(repo, key, title, "medium", StatusError, err.Error(), rem)
 	}
 	if len(uses) > 0 {
@@ -85,11 +105,7 @@ func listWorkflowFiles(ctx context.Context, c *github.Client, owner, name, branc
 	return out, nil
 }
 
-func workflowsUsingCodeQL(ctx context.Context, c *github.Client, owner, name, branch string) ([]string, error) {
-	files, err := listWorkflowFiles(ctx, c, owner, name, branch)
-	if err != nil {
-		return nil, err
-	}
+func workflowsUsingCodeQL(files map[string]string) ([]string, error) {
 	var found []string
 	for fname, content := range files {
 		uses, err := workflowUsesAction(content, "github/codeql-action/")
@@ -111,6 +127,9 @@ func workflowUsesAction(content, actionPrefix string) (bool, error) {
 	}
 	var visit func(*yaml.Node) bool
 	visit = func(node *yaml.Node) bool {
+		if node.Kind == yaml.AliasNode && node.Alias != nil {
+			return visit(node.Alias)
+		}
 		if node.Kind == yaml.MappingNode {
 			for i := 0; i+1 < len(node.Content); i += 2 {
 				key, value := node.Content[i], node.Content[i+1]
@@ -134,98 +153,55 @@ func workflowUsesAction(content, actionPrefix string) (bool, error) {
 	return visit(&root), nil
 }
 
-func auditGitHubWorkflowTokenPermissions(ctx context.Context, c *github.Client, owner, name string, repo *github.Repository) auditRow {
-	const (
-		key   = "workflow-token-permissions"
-		title = "Workflows set least-privilege GITHUB_TOKEN permissions"
-		rem   = "Add a top-level `permissions:` block (e.g. `contents: read`) to each workflow so GITHUB_TOKEN is least-privilege, not the broad default."
-	)
-	files, err := listWorkflowFiles(ctx, c, owner, name, repo.GetDefaultBranch())
-	if err != nil {
-		if endpointUnavailable(err) {
-			return githubAuditRow(repo, key, title, "high", StatusSkipped, "workflows not readable", rem)
-		}
-		return githubAuditRow(repo, key, title, "high", StatusError, err.Error(), rem)
-	}
-	if len(files) == 0 {
-		return githubAuditRow(repo, key, title, "high", StatusCompliant, "no Actions workflows", rem)
-	}
-	var weak []string
-	for fname, content := range files {
-		if issue := workflowPermissionIssue(content); issue != "" {
-			weak = append(weak, fname+" ("+issue+")")
-		}
-	}
-	if len(weak) > 0 {
-		sort.Strings(weak)
-		return githubAuditRow(repo, key, title, "high", StatusGap, "workflows without least-privilege token permissions: "+strings.Join(limitStrings(weak, maxDetailItems), ", "), rem)
-	}
-	return githubAuditRow(repo, key, title, "high", StatusCompliant, fmt.Sprintf("all %d workflow(s) declare explicit token permissions", len(files)), rem)
+// parsedWorkflow is the subset of workflow YAML the supply-chain checks need.
+type parsedWorkflow struct {
+	On          any                    `yaml:"on"`
+	Permissions any                    `yaml:"permissions"`
+	Jobs        map[string]workflowJob `yaml:"jobs"`
 }
 
-func workflowPermissionIssue(content string) string {
-	var workflow struct {
-		Permissions any `yaml:"permissions"`
-		Jobs        map[string]struct {
-			Permissions any `yaml:"permissions"`
-		} `yaml:"jobs"`
-	}
-	if err := yaml.Unmarshal([]byte(content), &workflow); err != nil {
-		return "unparseable"
-	}
-	if workflow.Permissions != nil {
-		if issue := permTooBroad(workflow.Permissions); issue != "" {
-			return issue
-		}
-		for _, job := range workflow.Jobs {
-			if job.Permissions == nil {
-				continue
-			}
-			if issue := permTooBroad(job.Permissions); issue != "" {
-				return issue
-			}
-		}
-		return ""
-	}
-	if len(workflow.Jobs) == 0 {
-		return "no explicit permissions"
-	}
-	for _, job := range workflow.Jobs {
-		if job.Permissions == nil {
-			return "no explicit permissions"
-		}
-		if issue := permTooBroad(job.Permissions); issue != "" {
-			return issue
-		}
-	}
-	return ""
+type workflowJob struct {
+	Uses            string         `yaml:"uses"`
+	RunsOn          any            `yaml:"runs-on"`
+	Environment     any            `yaml:"environment"`
+	If              any            `yaml:"if"`
+	ContinueOnError any            `yaml:"continue-on-error"`
+	Permissions     any            `yaml:"permissions"`
+	Steps           []workflowStep `yaml:"steps"`
 }
 
-func permTooBroad(permission any) string {
-	switch value := permission.(type) {
+type workflowStep struct {
+	Uses            string         `yaml:"uses"`
+	Run             string         `yaml:"run"`
+	If              any            `yaml:"if"`
+	ContinueOnError any            `yaml:"continue-on-error"`
+	With            map[string]any `yaml:"with"`
+}
+
+func parseWorkflow(content string) (*parsedWorkflow, error) {
+	var w parsedWorkflow
+	if err := yaml.Unmarshal([]byte(content), &w); err != nil {
+		return nil, err
+	}
+	return &w, nil
+}
+
+// workflowTriggers normalizes `on:` (string, list, or map) into a name set.
+func workflowTriggers(on any) map[string]bool {
+	out := map[string]bool{}
+	switch v := on.(type) {
 	case string:
-		switch value {
-		case "write-all":
-			return "write-all token"
-		case "read-all", "none":
-			return ""
-		default:
-			return "invalid permissions value"
+		out[strings.ToLower(strings.TrimSpace(v))] = true
+	case []any:
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				out[strings.ToLower(strings.TrimSpace(s))] = true
+			}
 		}
 	case map[string]any:
-		for key, raw := range value {
-			permissionValue, ok := raw.(string)
-			if !ok {
-				return "invalid permission value: " + key
-			}
-			switch permissionValue {
-			case "read", "write", "none":
-			default:
-				return "invalid permission value: " + key
-			}
+		for k := range v {
+			out[strings.ToLower(strings.TrimSpace(k))] = true
 		}
-		return ""
-	default:
-		return "invalid permissions value"
 	}
+	return out
 }

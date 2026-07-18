@@ -2,18 +2,25 @@ package repoharden
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/go-github/v88/github"
 )
 
-func TestRecorderUpdatesPriorOnReharden(t *testing.T) {
+func TestRecorderRefreshesAppliedPriorOnReharden(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "harden.json")
 	r := newHardenRecorder(path, testStateScope, nil)
-	if _, err := r.record(HardenEntry{Repo: "me/app", Control: "token-readonly", Prior: `{"default_workflow_permissions":"write"}`}); err != nil {
+	entry := HardenEntry{Repo: "me/app", Control: "token-readonly", Prior: `{"default_workflow_permissions":"write"}`}
+	if _, err := r.record(entry); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.setPhase(entry, HardenPhaseApplied); err != nil {
 		t.Fatal(err)
 	}
 	fresh := `{"default_workflow_permissions":"read","can_approve_pull_request_reviews":true}`
@@ -29,6 +36,36 @@ func TestRecorderUpdatesPriorOnReharden(t *testing.T) {
 	}
 	if got[0].Prior != fresh {
 		t.Fatalf("prior not refreshed on re-harden: got %q, want %q", got[0].Prior, fresh)
+	}
+}
+
+func TestRecorderPreservesAmbiguousPriorOnReharden(t *testing.T) {
+	for _, phase := range []HardenPhase{HardenPhasePending, HardenPhaseUnknown} {
+		t.Run(string(phase), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "harden.json")
+			r := newHardenRecorder(path, testStateScope, nil)
+			original := HardenEntry{Repo: "me/app", Control: "token-readonly", Prior: `{"default_workflow_permissions":"write"}`}
+			if _, err := r.record(original); err != nil {
+				t.Fatal(err)
+			}
+			if phase == HardenPhaseUnknown {
+				if err := r.setPhase(original, phase); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			fresh := `{"default_workflow_permissions":"read","can_approve_pull_request_reviews":true}`
+			if _, err := r.record(HardenEntry{Repo: original.Repo, Control: original.Control, Prior: fresh}); err == nil || !strings.Contains(err.Error(), "refusing to replace ambiguous") {
+				t.Fatalf("record() error = %v, want ambiguous-state refusal", err)
+			}
+			got, err := loadHardenState(path, testStateScope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 1 || got[0].Prior != original.Prior || got[0].Phase != phase {
+				t.Fatalf("ambiguous state changed: %+v", got)
+			}
+		})
 	}
 }
 
@@ -79,14 +116,19 @@ func TestRevertCallsRevertWithPrior(t *testing.T) {
 	t.Cleanup(func() { baseline = saved })
 	var gotPrior string
 	var calls int
+	reverted := false
 	baseline = []Control{{
 		Key: "x",
 		Detect: func(context.Context, *github.Client, string, string, *github.Repository) DetectResult {
+			if reverted {
+				return DetectResult{Status: StatusGap, Prior: "write"}
+			}
 			return DetectResult{Status: StatusCompliant}
 		},
 		Revert: func(_ context.Context, _ *github.Client, owner, name, prior string) error {
 			calls++
 			gotPrior = prior
+			reverted = true
 			return nil
 		},
 	}}
@@ -144,6 +186,65 @@ func TestRevertRefusesToOverwriteDrift(t *testing.T) {
 	}
 }
 
+func TestRevertRefusesPendingEntryWhenLiveMatchesHardened(t *testing.T) {
+	saved := baseline
+	t.Cleanup(func() { baseline = saved })
+	var calls int
+	baseline = []Control{{
+		Key: "x",
+		Detect: func(context.Context, *github.Client, string, string, *github.Repository) DetectResult {
+			return DetectResult{Status: StatusCompliant}
+		},
+		Revert: func(context.Context, *github.Client, string, string, string) error {
+			calls++
+			return nil
+		},
+	}}
+	entries := revertEntries(context.Background(), mockClient(map[string]string{"GET /repos/me/app": `{"full_name":"me/app"}`}), &opts{concurrency: 1},
+		[]HardenEntry{{Repo: "me/app", Control: "x", Prior: "write", Phase: HardenPhasePending}})
+	if calls != 0 {
+		t.Fatalf("revert ran %d times for a pending entry, want 0 (the change was never verified applied)", calls)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("pending entry must remain in state, got %d remaining", len(entries))
+	}
+}
+
+func TestRevertDropsPendingEntryWhenPriorStillLive(t *testing.T) {
+	saved := baseline
+	t.Cleanup(func() { baseline = saved })
+	var calls int
+	baseline = []Control{{
+		Key: "x",
+		Detect: func(context.Context, *github.Client, string, string, *github.Repository) DetectResult {
+			return DetectResult{Status: StatusGap, Prior: "write"}
+		},
+		Revert: func(context.Context, *github.Client, string, string, string) error {
+			calls++
+			return nil
+		},
+	}}
+	entries := revertEntries(context.Background(), mockClient(map[string]string{"GET /repos/me/app": `{"full_name":"me/app"}`}), &opts{concurrency: 1},
+		[]HardenEntry{{Repo: "me/app", Control: "x", Prior: "write", Phase: HardenPhasePending}})
+	if calls != 0 || len(entries) != 0 {
+		t.Fatalf("unchanged pending entry should drop cleanly: calls=%d remaining=%d", calls, len(entries))
+	}
+}
+
+func TestCollectHardenRejectsReportOnlySelection(t *testing.T) {
+	saved := baseline
+	t.Cleanup(func() { baseline = saved })
+	baseline = []Control{{Key: "security-md"}}
+	_, _, _, err := collectHarden(context.Background(), nil, &opts{concurrency: 1, only: "security-md"}, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "report-only") {
+		t.Fatalf("err=%v, want report-only rejection", err)
+	}
+	var ue usageError
+	if !errors.As(err, &ue) {
+		t.Fatalf("err=%T, want usageError (exit 2)", err)
+	}
+}
+
 func TestRevertKeepsUnknownControl(t *testing.T) {
 	saved := baseline
 	t.Cleanup(func() { baseline = saved })
@@ -163,6 +264,9 @@ func TestCollectHardenAppliesOnlyGaps(t *testing.T) {
 		{
 			Key: "gap-ctl",
 			Detect: func(context.Context, *github.Client, string, string, *github.Repository) DetectResult {
+				if applied > 0 {
+					return DetectResult{Status: StatusCompliant}
+				}
 				return DetectResult{Status: StatusGap, Prior: "off"}
 			},
 			Apply:  func(context.Context, *github.Client, string, string) error { applied++; return nil },
@@ -268,7 +372,7 @@ func TestCmdHardenPersistsAppliedState(t *testing.T) {
 	}}
 	client := mockClient(map[string]string{
 		"GET /user/repos": `[{"full_name":"me/app","owner":{"login":"me"},"fork":false,"archived":false}]`,
-		"GET /user":       `{"login":"tester"}`,
+		"GET /user":       `{"login":"tester","id":42}`,
 	})
 	path := filepath.Join(t.TempDir(), "harden.json")
 	o := &opts{host: "github.com", stateFile: path, concurrency: 1}
@@ -341,6 +445,126 @@ func TestCollectHardenCompensatesPartialApplyAndClearsState(t *testing.T) {
 	}
 }
 
+func TestCollectHardenCompensatesRealActionsPartialFailure(t *testing.T) {
+	selected := false
+	shaPinned := false
+	selectedWrites := 0
+	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.Method == http.MethodGet && req.URL.Path == "/repos/me/app/actions/permissions":
+			allowed := "all"
+			if selected {
+				allowed = "selected"
+			}
+			return jsonResponse(fmt.Sprintf(`{"enabled":true,"allowed_actions":%q,"sha_pinning_required":%t}`, allowed, shaPinned)), nil
+		case req.Method == http.MethodGet && req.URL.Path == "/repos/me/app/actions/permissions/selected-actions":
+			return jsonResponse(`{"github_owned_allowed":false,"verified_allowed":false,"patterns_allowed":["unsafe/*"]}`), nil
+		case req.Method == http.MethodPut && req.URL.Path == "/repos/me/app/actions/permissions":
+			data, _ := io.ReadAll(req.Body)
+			selected = strings.Contains(string(data), `"allowed_actions":"selected"`)
+			shaPinned = strings.Contains(string(data), `"sha_pinning_required":true`)
+			return jsonResponse(`{}`), nil
+		case req.Method == http.MethodPut && req.URL.Path == "/repos/me/app/actions/permissions/selected-actions":
+			selectedWrites++
+			return &http.Response{
+				StatusCode: http.StatusInternalServerError,
+				Status:     "500 Internal Server Error",
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"message":"partial failure"}`)),
+				Request:    req,
+			}, nil
+		default:
+			return &http.Response{StatusCode: http.StatusNotFound, Header: make(http.Header), Body: http.NoBody, Request: req}, nil
+		}
+	})})
+	path := filepath.Join(t.TempDir(), "state.json")
+	recorder := newHardenRecorder(path, testStateScope, nil)
+	repos := []*github.Repository{{FullName: github.Ptr("me/app")}}
+	_, _, failed, err := collectHarden(context.Background(), client, &opts{concurrency: 1, only: "actions-allowlist"}, repos, recorder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed != 1 || selectedWrites != 1 {
+		t.Fatalf("failed=%d selected-writes=%d, want 1/1", failed, selectedWrites)
+	}
+	if selected {
+		t.Fatal("compensating revert did not restore allowed_actions=all")
+	}
+	entries, err := loadHardenState(path, testStateScope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("verified compensation must clear pending state: %+v", entries)
+	}
+}
+
+func TestCollectHardenRejectsUnverifiedSuccessfulApply(t *testing.T) {
+	saved := baseline
+	t.Cleanup(func() { baseline = saved })
+	var reverted bool
+	baseline = []Control{{
+		Key: "no-op",
+		Detect: func(context.Context, *github.Client, string, string, *github.Repository) DetectResult {
+			return DetectResult{Status: StatusGap, Prior: "off"}
+		},
+		Apply: func(context.Context, *github.Client, string, string) error { return nil },
+		Revert: func(context.Context, *github.Client, string, string, string) error {
+			reverted = true
+			return nil
+		},
+	}}
+	path := filepath.Join(t.TempDir(), "state.json")
+	recorder := newHardenRecorder(path, testStateScope, nil)
+	_, _, failed, err := collectHarden(context.Background(), nil, &opts{concurrency: 1}, []*github.Repository{{FullName: github.Ptr("me/app")}}, recorder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed != 1 || reverted {
+		t.Fatalf("failed=%d reverted=%v, want 1/false for a verified no-op", failed, reverted)
+	}
+}
+
+func TestPriorStateRestoredAcceptsEquivalentCompliantAlternative(t *testing.T) {
+	if !priorStateRestored(DetectResult{Status: StatusCompliant, Prior: "not-configured"}, "not-configured") {
+		t.Fatal("an exact restored state that remains compliant through an alternative setup must be accepted")
+	}
+	if priorStateRestored(DetectResult{Status: StatusCompliant}, "") {
+		t.Fatal("an empty prior must not make an unrelated compliant state look restored")
+	}
+	if priorStateRestored(DetectResult{Status: StatusSkipped, Prior: "not-configured"}, "not-configured") {
+		t.Fatal("an unverifiable result must not count as restored")
+	}
+}
+
+func TestRevertEntriesAcceptsCodeScanningAdvancedSetup(t *testing.T) {
+	defaultSetup := "configured"
+	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.Method == http.MethodGet && req.URL.Path == "/repos/me/app":
+			return jsonResponse(`{"full_name":"me/app","default_branch":"main"}`), nil
+		case req.Method == http.MethodGet && req.URL.Path == "/repos/me/app/code-scanning/default-setup":
+			return jsonResponse(fmt.Sprintf(`{"state":%q}`, defaultSetup)), nil
+		case req.Method == http.MethodPatch && req.URL.Path == "/repos/me/app/code-scanning/default-setup":
+			defaultSetup = "not-configured"
+			return jsonResponse(`{"state":"not-configured"}`), nil
+		case req.Method == http.MethodGet && req.URL.Path == "/repos/me/app/code-scanning/analyses":
+			return jsonResponse(`[{"id":1,"created_at":"2999-01-01T00:00:00Z"}]`), nil
+		default:
+			return &http.Response{StatusCode: http.StatusNotFound, Header: make(http.Header), Body: http.NoBody, Request: req}, nil
+		}
+	})})
+	var remaining []HardenEntry
+	_ = captureStdout(t, func() {
+		remaining = revertEntries(context.Background(), client, &opts{concurrency: 1}, []HardenEntry{{
+			Repo: "me/app", Control: "code-scanning", Prior: "not-configured", Phase: HardenPhaseApplied,
+		}})
+	})
+	if len(remaining) != 0 || defaultSetup != "not-configured" {
+		t.Fatalf("remaining=%+v defaultSetup=%q, want verified advanced-setup restoration", remaining, defaultSetup)
+	}
+}
+
 func TestScopeEntriesIncludesRepositoryFilters(t *testing.T) {
 	entries := []HardenEntry{
 		{Repo: "me/a", Control: "branch-protection"},
@@ -366,16 +590,21 @@ func TestCmdRevertRespectsRepoScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	var deleted []string
+	alertsEnabled := true
 	client := mustClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		switch {
 		case req.Method == http.MethodGet && req.URL.Path == "/user":
-			return jsonResponse(`{"login":"tester"}`), nil
+			return jsonResponse(`{"login":"tester","id":42}`), nil
 		case req.Method == http.MethodGet && req.URL.Path == "/repos/me/b":
 			return jsonResponse(`{"full_name":"me/b","owner":{"login":"me"}}`), nil
 		case req.Method == http.MethodGet && req.URL.Path == "/repos/me/b/vulnerability-alerts":
+			if !alertsEnabled {
+				return &http.Response{StatusCode: http.StatusNotFound, Header: make(http.Header), Body: http.NoBody, Request: req}, nil
+			}
 			return &http.Response{StatusCode: http.StatusNoContent, Header: make(http.Header), Body: http.NoBody, Request: req}, nil
 		case req.Method == http.MethodDelete:
 			deleted = append(deleted, req.URL.Path)
+			alertsEnabled = false
 			return &http.Response{StatusCode: http.StatusNoContent, Header: make(http.Header), Body: http.NoBody}, nil
 		default:
 			return &http.Response{StatusCode: http.StatusNotFound, Header: make(http.Header), Body: http.NoBody}, nil

@@ -1,6 +1,7 @@
 package repoharden
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -28,7 +29,8 @@ func newRestClient(provider string, o *opts) (*restClient, error) {
 		return nil, err
 	}
 	if token == "" {
-		return nil, fmt.Errorf("no %s token found for %s", provider, o.host)
+		return nil, fmt.Errorf("no %s token found for %s - set %s, or pass --token/--token-stdin",
+			provider, o.host, providerTokenEnvName(provider))
 	}
 	header := "Authorization"
 	prefix := "Bearer "
@@ -96,7 +98,11 @@ func (c *restClient) get(ctx context.Context, path string, query url.Values, out
 	if out == nil {
 		return resp, nil
 	}
-	dec := json.NewDecoder(io.LimitReader(resp.Body, maxRESTResponseBytes))
+	data, err := readLimitedResponse(resp.Body, maxRESTResponseBytes)
+	if err != nil {
+		return resp, err
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
 	if err := dec.Decode(out); err != nil {
 		return resp, err
 	}
@@ -104,6 +110,46 @@ func (c *restClient) get(ctx context.Context, path string, query url.Values, out
 		return resp, err
 	}
 	return resp, nil
+}
+
+// getText fetches a raw (non-JSON) resource, e.g. a pipeline definition file.
+func (c *restClient) getText(ctx context.Context, path string, query url.Values) (string, error) {
+	u := strings.TrimRight(c.baseURL, "/") + path
+	if len(query) > 0 {
+		u += "?" + query.Encode()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set(c.header, c.prefix+c.token)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return "", &restError{method: http.MethodGet, path: path, statusCode: resp.StatusCode, status: resp.Status}
+	}
+	data, err := readLimitedResponse(resp.Body, maxRESTResponseBytes)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func readLimitedResponse(r io.Reader, limit int64) ([]byte, error) {
+	if limit < 0 {
+		return nil, errors.New("response size limit must be non-negative")
+	}
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("response exceeds %d-byte safety limit", limit)
+	}
+	return data, nil
 }
 
 func providerRow(provider, scope, target, key, title, severity string, status ControlStatus, detail, remediation string) auditRow {
@@ -121,17 +167,34 @@ func providerRow(provider, scope, target, key, title, severity string, status Co
 }
 
 func httpUnavailable(err error) bool {
-	if err == nil {
+	return httpPermissionDenied(err) || httpNotFound(err) || httpUnsupported(err)
+}
+
+// Authentication failures are errors, while an authenticated caller that lacks
+// a particular permission is an unverifiable audit result.
+func httpPermissionDenied(err error) bool {
+	return restStatusCode(err) == http.StatusForbidden
+}
+
+func httpNotFound(err error) bool {
+	return restStatusCode(err) == http.StatusNotFound
+}
+
+func httpUnsupported(err error) bool {
+	switch restStatusCode(err) {
+	case http.StatusMethodNotAllowed, http.StatusGone, http.StatusNotImplemented:
+		return true
+	default:
 		return false
 	}
+}
+
+func restStatusCode(err error) int {
 	var restErr *restError
 	if errors.As(err, &restErr) {
-		switch restErr.statusCode {
-		case http.StatusForbidden, http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusGone:
-			return true
-		}
+		return restErr.statusCode
 	}
-	return false
+	return 0
 }
 
 func requireSecureURL(raw string) error {

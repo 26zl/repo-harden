@@ -2,6 +2,10 @@ package repoharden
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -45,13 +49,16 @@ func TestGitlabPagedRejectsNonAdvancingPagination(t *testing.T) {
 	}
 }
 
-func TestGiteaPagedStopsOnShortPage(t *testing.T) {
+func TestGiteaPagedContinuesPastShortPageUntilEmpty(t *testing.T) {
 	full := "[" + strings.Repeat(`{"x":1},`, 49) + `{"x":1}]`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("page") == "1" {
+		switch r.URL.Query().Get("page") {
+		case "1":
 			_, _ = w.Write([]byte(full))
-		} else {
+		case "2":
 			_, _ = w.Write([]byte(`[{"x":1}]`))
+		default:
+			_, _ = w.Write([]byte(`[]`))
 		}
 	}))
 	defer srv.Close()
@@ -62,6 +69,76 @@ func TestGiteaPagedStopsOnShortPage(t *testing.T) {
 	}
 	if len(got) != 51 {
 		t.Fatalf("got %d items, want 51 (50 + 1 across two pages)", len(got))
+	}
+}
+
+func TestGiteaPagedHandlesMetadataFreeServerPageCap(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("page") {
+		case "1":
+			_, _ = w.Write([]byte(`[{"x":1},{"x":2}]`))
+		case "2":
+			_, _ = w.Write([]byte(`[{"x":3}]`))
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer srv.Close()
+	client := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", prefix: "token ", client: srv.Client()}
+	got, err := giteaPaged[map[string]any](context.Background(), client, "/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d items, want all 3 across capped metadata-free pages", len(got))
+	}
+}
+
+func TestGiteaPagedHonorsTotalCountWhenServerCapsPageSize(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Total-Count", "3")
+		switch r.URL.Query().Get("page") {
+		case "1":
+			_, _ = w.Write([]byte(`[{"x":1},{"x":2}]`))
+		case "2":
+			_, _ = w.Write([]byte(`[{"x":3}]`))
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer srv.Close()
+	client := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", prefix: "token ", client: srv.Client()}
+	got, err := giteaPaged[map[string]any](context.Background(), client, "/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d items, want all 3 despite a page cap below requested limit", len(got))
+	}
+}
+
+func TestGiteaPagedRejectsNonAdvancingLink(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Link", `<https://gitea.example/api/v1/x?page=1>; rel="next"`)
+		_, _ = w.Write([]byte(`[{"x":1}]`))
+	}))
+	defer srv.Close()
+	client := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", prefix: "token ", client: srv.Client()}
+	if _, err := giteaPaged[map[string]any](context.Background(), client, "/x"); err == nil || !strings.Contains(err.Error(), "non-advancing") {
+		t.Fatalf("non-advancing Link must fail closed, got %v", err)
+	}
+}
+
+func TestGiteaPagedValidatesLinkEvenWithTotalCount(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Total-Count", "2")
+		w.Header().Set("Link", `<https://gitea.example/api/v1/x?page=1>; rel="next"`)
+		_, _ = w.Write([]byte(`[{"x":1}]`))
+	}))
+	defer srv.Close()
+	client := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", prefix: "token ", client: srv.Client()}
+	if _, err := giteaPaged[map[string]any](context.Background(), client, "/x"); err == nil || !strings.Contains(err.Error(), "non-advancing") {
+		t.Fatalf("non-advancing Link must be validated even with X-Total-Count, got %v", err)
 	}
 }
 
@@ -140,6 +217,8 @@ func TestAuditGitLabBranchProtectionClassifies(t *testing.T) {
 	}{
 		{"protected", http.StatusOK, StatusCompliant},
 		{"unprotected", http.StatusNotFound, StatusGap},
+		{"forbidden", http.StatusForbidden, StatusSkipped},
+		{"unsupported", http.StatusMethodNotAllowed, StatusSkipped},
 		{"server-error", http.StatusInternalServerError, StatusError},
 	}
 	for _, tc := range cases {
@@ -165,6 +244,28 @@ func TestAuditGitLabBranchProtectionClassifies(t *testing.T) {
 	}
 }
 
+func TestGitLabRequiredWorkflowDistinguishesMissingFromForbidden(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		want   ControlStatus
+	}{
+		{http.StatusNotFound, StatusGap},
+		{http.StatusForbidden, StatusSkipped},
+		{http.StatusMethodNotAllowed, StatusSkipped},
+		{http.StatusInternalServerError, StatusError},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(tc.status)
+		}))
+		client := &restClient{baseURL: srv.URL, token: "t", header: "PRIVATE-TOKEN", client: srv.Client()}
+		row := auditGitLabRequiredWorkflows(context.Background(), client, gitlabProject{ID: 1, PathWithNamespace: "me/app", DefaultBranch: "main"})
+		srv.Close()
+		if row.Status != string(tc.want) {
+			t.Errorf("status %d: got %s detail=%q, want %s", tc.status, row.Status, row.Detail, tc.want)
+		}
+	}
+}
+
 func TestCollectGitLabAuditSmoke(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v4/projects" {
@@ -174,12 +275,12 @@ func TestCollectGitLabAuditSmoke(t *testing.T) {
 		http.NotFound(w, r)
 	}))
 	defer srv.Close()
-	rows, count, err := collectGitLabAudit(context.Background(), &opts{provider: "gitlab", host: srv.URL, token: "t", staleDays: 180})
+	rows, repositories, err := collectGitLabAudit(context.Background(), &opts{provider: "gitlab", host: srv.URL, token: "t", staleDays: 180})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 {
-		t.Fatalf("project count = %d, want 1", count)
+	if len(repositories) != 1 || repositories[0] != "me/app" {
+		t.Fatalf("project universe = %v, want [me/app]", repositories)
 	}
 	if len(rows) == 0 {
 		t.Fatal("expected audit rows for the project")
@@ -203,7 +304,7 @@ func TestGiteaWorkflowsPreservesNonUnavailableError(t *testing.T) {
 		prefix:  "token ",
 		client:  srv.Client(),
 	}
-	row := auditGiteaWorkflows(context.Background(), client, "gitea", giteaRepo{FullName: "me/app", DefaultBranch: "main"})
+	row := giteaWorkflowsRowForTest(client, giteaRepo{FullName: "me/app", DefaultBranch: "main"})
 	if row.Status != string(StatusError) {
 		t.Fatalf("status = %s detail=%q, want error", row.Status, row.Detail)
 	}
@@ -212,6 +313,10 @@ func TestGiteaWorkflowsPreservesNonUnavailableError(t *testing.T) {
 func TestCollectGiteaAuditSmoke(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/user/repos" {
+			if r.URL.Query().Get("page") != "1" {
+				_, _ = w.Write([]byte(`[]`))
+				return
+			}
 			_, _ = w.Write([]byte(`[{
 				"full_name":"me/app",
 				"default_branch":"main",
@@ -224,14 +329,14 @@ func TestCollectGiteaAuditSmoke(t *testing.T) {
 		http.NotFound(w, r)
 	}))
 	defer srv.Close()
-	rows, count, err := collectGiteaAudit(context.Background(), &opts{
+	rows, repositories, err := collectGiteaAudit(context.Background(), &opts{
 		provider: "gitea", host: srv.URL, token: "t", staleDays: 180, concurrency: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 || len(rows) == 0 {
-		t.Fatalf("count=%d rows=%d, want one repo with audit rows", count, len(rows))
+	if len(repositories) != 1 || repositories[0] != "me/app" || len(rows) == 0 {
+		t.Fatalf("repositories=%v rows=%d, want one repo with audit rows", repositories, len(rows))
 	}
 }
 
@@ -254,7 +359,11 @@ func TestGiteaBranchProtectionRequiresDepth(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				_, _ = w.Write([]byte(tc.body))
+				if r.URL.Query().Get("page") == "1" {
+					_, _ = w.Write([]byte(tc.body))
+					return
+				}
+				_, _ = w.Write([]byte(`[]`))
 			}))
 			defer srv.Close()
 			client := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", prefix: "token ", client: srv.Client()}
@@ -288,12 +397,489 @@ func TestAuditGiteaSecretsPaginates(t *testing.T) {
 			_, _ = w.Write([]byte(full))
 			return
 		}
-		_, _ = w.Write([]byte(`[{"name":"S"}]`))
+		if r.URL.Query().Get("page") == "2" {
+			_, _ = w.Write([]byte(`[{"name":"S"}]`))
+			return
+		}
+		_, _ = w.Write([]byte(`[]`))
 	}))
 	defer srv.Close()
 	client := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", prefix: "token ", client: srv.Client()}
 	row := auditGiteaSecrets(context.Background(), client, "gitea", giteaRepo{FullName: "me/app"})
 	if !strings.Contains(row.Detail, "51 action secrets") {
 		t.Fatalf("detail=%q, want 51 secrets counted across two pages (would be 50 without pagination)", row.Detail)
+	}
+}
+
+func TestAuditGitLabBranchProtectionRequiresApplicableApprovalRule(t *testing.T) {
+	tests := []struct {
+		name  string
+		rules string
+		want  ControlStatus
+	}{
+		{"project-wide rule", `[{"approvals_required":1}]`, StatusCompliant},
+		{"all protected branches", `[{"approvals_required":1,"applies_to_all_protected_branches":true}]`, StatusCompliant},
+		{"exact default branch", `[{"approvals_required":1,"protected_branches":[{"name":"main"}]}]`, StatusCompliant},
+		{"default branch pattern", `[{"approvals_required":1,"protected_branches":[{"name":"main*"}]}]`, StatusCompliant},
+		{"different protected branch", `[{"approvals_required":2,"protected_branches":[{"name":"release/*"}]}]`, StatusGap},
+		{"zero approvals", `[{"approvals_required":0,"applies_to_all_protected_branches":true}]`, StatusGap},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/approval_rules") {
+					_, _ = w.Write([]byte(test.rules))
+					return
+				}
+				_, _ = w.Write([]byte(`{"name":"main","allow_force_push":false,"push_access_levels":[{"access_level":0}]}`))
+			}))
+			defer srv.Close()
+			client := &restClient{baseURL: srv.URL, token: "t", header: "PRIVATE-TOKEN", client: srv.Client()}
+			project := gitlabProject{ID: 1, PathWithNamespace: "group/app", DefaultBranch: "main"}
+			row := auditGitLabBranchProtection(context.Background(), client, project)
+			if row.Status != string(test.want) {
+				t.Fatalf("status=%s detail=%q, want %s", row.Status, row.Detail, test.want)
+			}
+		})
+	}
+}
+
+func TestReadLimitedResponseRejectsOversize(t *testing.T) {
+	got, err := readLimitedResponse(strings.NewReader("12345"), 4)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversized response: data=%q err=%v, want an explicit size error", got, err)
+	}
+	got, err = readLimitedResponse(strings.NewReader("1234"), 4)
+	if err != nil || string(got) != "1234" {
+		t.Fatalf("response at limit: data=%q err=%v", got, err)
+	}
+}
+
+func TestRESTClientRejectsOversizedJSONAndText(t *testing.T) {
+	oversized := strings.Repeat("x", maxRESTResponseBytes+1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/json" {
+			_, _ = w.Write([]byte(`{"value":"` + oversized + `"}`))
+			return
+		}
+		_, _ = w.Write([]byte(oversized))
+	}))
+	defer srv.Close()
+	c := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", client: srv.Client()}
+	var out map[string]string
+	if _, err := c.get(context.Background(), "/json", nil, &out); err == nil || !strings.Contains(err.Error(), "safety limit") {
+		t.Fatalf("oversized JSON error = %v", err)
+	}
+	if _, err := c.getText(context.Background(), "/text", nil); err == nil || !strings.Contains(err.Error(), "safety limit") {
+		t.Fatalf("oversized text error = %v", err)
+	}
+}
+
+func TestRESTStatusClassificationIsDisjoint(t *testing.T) {
+	cases := []struct {
+		code                             int
+		permission, missing, unsupported bool
+	}{
+		{http.StatusUnauthorized, false, false, false},
+		{http.StatusForbidden, true, false, false},
+		{http.StatusNotFound, false, true, false},
+		{http.StatusMethodNotAllowed, false, false, true},
+		{http.StatusGone, false, false, true},
+		{http.StatusNotImplemented, false, false, true},
+	}
+	for _, tc := range cases {
+		err := &restError{statusCode: tc.code}
+		if got := httpPermissionDenied(err); got != tc.permission {
+			t.Errorf("status %d permission=%v, want %v", tc.code, got, tc.permission)
+		}
+		if got := httpNotFound(err); got != tc.missing {
+			t.Errorf("status %d missing=%v, want %v", tc.code, got, tc.missing)
+		}
+		if got := httpUnsupported(err); got != tc.unsupported {
+			t.Errorf("status %d unsupported=%v, want %v", tc.code, got, tc.unsupported)
+		}
+	}
+	wrapped := errors.New("not a REST error")
+	if httpUnavailable(wrapped) {
+		t.Fatal("non-REST error must not be classified as an unavailable endpoint")
+	}
+}
+
+func TestGitlabPipelineFindings(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    []string
+	}{
+		{"unpinned image", "image: alpine:3.20\nbuild:\n  script: [make]\n", []string{"image alpine:3.20 not pinned to a full SHA-256 digest"}},
+		{"digest-pinned image", "image: alpine@sha256:" + strings.Repeat("a", 64) + "\nbuild:\n  script: [make]\n", nil},
+		{"short digest is rejected", "image: alpine@sha256:abc123\nbuild:\n  script: [make]\n", []string{"image alpine@sha256:abc123 not pinned to a full SHA-256 digest"}},
+		{"malformed digest reference is rejected", "image: alpine@latest@sha256:" + strings.Repeat("a", 64) + "\n", []string{"image alpine@latest@sha256:" + strings.Repeat("a", 64) + " not pinned to a full SHA-256 digest"}},
+		{"variable image is unverifiable", "image: $CI_REGISTRY_IMAGE:latest\nbuild:\n  script: [make]\n", []string{"image $CI_REGISTRY_IMAGE:latest"}},
+		{"job image and named service", "build:\n  image:\n    name: golang:1.25\n  services:\n    - name: docker:dind\n  script: [make]\n",
+			[]string{"image docker:dind not pinned to a full SHA-256 digest", "image golang:1.25 not pinned to a full SHA-256 digest"}},
+		{"remote include", "include:\n  - remote: https://example.com/ci.yml\nbuild:\n  script: [make]\n", []string{"remote include https://example.com/ci.yml"}},
+		{"remote include string form", "include: https://example.com/ci.yml\n", []string{"remote include https://example.com/ci.yml"}},
+		{"project include without ref", "include:\n  - project: group/templates\n    file: ci.yml\n", []string{"include project group/templates without a pinned ref"}},
+		{"project include with mutable tag", "include:\n  - project: group/templates\n    ref: v1.2.3\n    file: ci.yml\n", []string{"include project group/templates ref v1.2.3 is not a full commit SHA"}},
+		{"project include with commit", "include:\n  - project: group/templates\n    ref: " + strings.Repeat("b", 40) + "\n    file: ci.yml\n", nil},
+		{"local include is fine", "include:\n  - local: ci/base.yml\n", nil},
+		{"component include with mutable version", "include:\n  - component: gitlab.example.com/group/comp/build@1.2.3\nbuild:\n  script: [make]\n", []string{"include component gitlab.example.com/group/comp/build@1.2.3 version 1.2.3 is not a full commit SHA"}},
+		{"component include with commit", "include:\n  - component: gitlab.example.com/group/comp/build@" + strings.Repeat("c", 40) + "\n", nil},
+		{"component include without version", "include:\n  - component: gitlab.example.com/group/comp/build\n", []string{"include component gitlab.example.com/group/comp/build without a pinned version"}},
+		{"variables entry named image is data", "variables:\n  image: alpine:3.20\nbuild:\n  script: [make]\n", nil},
+		{"default image is checked", "default:\n  image: alpine:3.20\nbuild:\n  script: [make]\n", []string{"image alpine:3.20 not pinned to a full SHA-256 digest"}},
+	}
+	for _, c := range cases {
+		got, err := gitlabPipelineFindings(c.content)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if len(got) != len(c.want) {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+			}
+		}
+	}
+}
+
+func TestAuditGitLabPipelineSupplyChain(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, ".gitlab-ci.yml") {
+			_, _ = w.Write([]byte("image: alpine:3.20\nbuild:\n  script: [make]\n"))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	client := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", prefix: "Bearer ", client: srv.Client()}
+	p := gitlabProject{ID: 1, PathWithNamespace: "group/app", DefaultBranch: "main"}
+	row := auditGitLabPipelineSupplyChain(context.Background(), client, p)
+	if row.Status != string(StatusGap) || !strings.Contains(row.Detail, "alpine:3.20") {
+		t.Fatalf("unpinned image: status=%s detail=%q, want gap", row.Status, row.Detail)
+	}
+
+	missing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer missing.Close()
+	client = &restClient{baseURL: missing.URL, token: "t", header: "Authorization", prefix: "Bearer ", client: missing.Client()}
+	row = auditGitLabPipelineSupplyChain(context.Background(), client, p)
+	if row.Status != string(StatusCompliant) || !strings.Contains(row.Detail, "no .gitlab-ci.yml") {
+		t.Fatalf("no pipeline file: status=%s detail=%q, want compliant", row.Status, row.Detail)
+	}
+}
+
+func TestAuditGitLabPipelineDynamicReferenceIsUnverifiable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("image: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA\n"))
+	}))
+	defer srv.Close()
+	client := &restClient{baseURL: srv.URL, token: "t", header: "PRIVATE-TOKEN", client: srv.Client()}
+	row := auditGitLabPipelineSupplyChain(context.Background(), client, gitlabProject{ID: 1, PathWithNamespace: "g/p", DefaultBranch: "main"})
+	if row.Status != string(StatusSkipped) || !strings.Contains(row.Detail, "cannot be verified") {
+		t.Fatalf("dynamic image: status=%s detail=%q, want skipped/unverifiable", row.Status, row.Detail)
+	}
+}
+
+func TestGiteaWorkflowSupplyChain(t *testing.T) {
+	workflow := "on: push\njobs:\n  build:\n    steps:\n      - uses: someone/tool@v1\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/repos/me/app/contents/.gitea/workflows":
+			_, _ = w.Write([]byte(`[{"name":"ci.yml","path":".gitea/workflows/ci.yml","type":"file"}]`))
+		case "/api/v1/repos/me/app/contents/.gitea/workflows/ci.yml":
+			entry := map[string]string{
+				"name": "ci.yml", "path": ".gitea/workflows/ci.yml", "type": "file",
+				"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(workflow)),
+			}
+			_ = json.NewEncoder(w).Encode(entry)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	client := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", prefix: "token ", client: srv.Client()}
+	repo := giteaRepo{FullName: "me/app", DefaultBranch: "main"}
+	repo.Owner.Login = "me"
+	repo.Name = "app"
+
+	files, err := listGiteaWorkflowFiles(context.Background(), client, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("files = %v, want the .gitea/workflows file", files)
+	}
+
+	getWF := func() (map[string]string, error) { return files, nil }
+	row := giteaWorkflowSupplyChainRow("gitea", repo.FullName, "workflow-unpinned-actions",
+		"Third-party actions pinned to commit SHAs", "medium",
+		"third-party actions not SHA-pinned: ", "no unpinned third-party actions", "rem",
+		getWF, workflowUnpinnedUses)
+	if row.Status != string(StatusGap) || !strings.Contains(row.Detail, "someone/tool@v1") {
+		t.Fatalf("gitea unpinned: status=%s detail=%q, want gap naming the ref", row.Status, row.Detail)
+	}
+	row = giteaWorkflowSupplyChainRow("gitea", repo.FullName, "workflow-injection",
+		"No attacker-controlled expressions in run scripts", "high",
+		"attacker-controlled expressions in scripts: ", "clean", "rem",
+		getWF, workflowInjectionContexts)
+	if row.Status != string(StatusCompliant) {
+		t.Fatalf("gitea injection on clean file: status=%s, want compliant", row.Status)
+	}
+
+	empty := giteaWorkflowSupplyChainRow("gitea", repo.FullName, "workflow-unpinned-actions",
+		"t", "medium", "p: ", "clean", "rem",
+		func() (map[string]string, error) { return nil, nil }, workflowUnpinnedUses)
+	if empty.Status != string(StatusCompliant) {
+		t.Fatalf("no workflows: status=%s, want compliant", empty.Status)
+	}
+}
+
+func TestListGiteaWorkflowFilesRejectsInvalidContentMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name, file string
+	}{
+		{"missing encoding", `{"name":"ci.yml","path":".gitea/workflows/ci.yml","type":"file","content":"b246IHB1c2g="}`},
+		{"invalid base64", `{"name":"ci.yml","path":".gitea/workflows/ci.yml","type":"file","encoding":"base64","content":"%%%"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/workflows") {
+					_, _ = w.Write([]byte(`[{"name":"ci.yml","path":".gitea/workflows/ci.yml","type":"file"}]`))
+					return
+				}
+				if strings.HasSuffix(r.URL.Path, "/workflows/ci.yml") {
+					_, _ = w.Write([]byte(tc.file))
+					return
+				}
+				w.WriteHeader(http.StatusNotFound)
+			}))
+			defer srv.Close()
+			client := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", prefix: "token ", client: srv.Client()}
+			if _, err := listGiteaWorkflowFiles(context.Background(), client, giteaRepo{FullName: "me/app", DefaultBranch: "main"}); err == nil {
+				t.Fatal("invalid workflow content metadata must fail closed")
+			}
+		})
+	}
+}
+
+func TestGitLabSignedCommitsSkipsWhenPushRulesAbsent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	client := &restClient{baseURL: srv.URL, token: "t", header: "PRIVATE-TOKEN", client: srv.Client()}
+	row := auditGitLabSignedCommits(context.Background(), client, gitlabProject{ID: 1, PathWithNamespace: "me/app"})
+	if row.Status != string(StatusSkipped) {
+		t.Fatalf("status=%s detail=%q, want skipped (404 is ambiguous: no rule configured, or CE/Free without push rules)", row.Status, row.Detail)
+	}
+}
+
+func giteaWorkflowsRowForTest(client *restClient, repo giteaRepo) auditRow {
+	return auditGiteaWorkflows("gitea", repo, func() (map[string]string, error) {
+		return listGiteaWorkflowFiles(context.Background(), client, repo)
+	})
+}
+
+func TestAuditGiteaWorkflowsRequiresAFileNotOnlyADirectory(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/workflows") {
+			_, _ = w.Write([]byte(`[]`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	client := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", prefix: "token ", client: srv.Client()}
+	row := giteaWorkflowsRowForTest(client, giteaRepo{FullName: "me/app", DefaultBranch: "main"})
+	if row.Status != string(StatusGap) {
+		t.Fatalf("empty workflow directories: status=%s detail=%q, want gap", row.Status, row.Detail)
+	}
+}
+
+func TestListGiteaWorkflowFilesIncludesForgejoDir(t *testing.T) {
+	workflow := "on: push\njobs:\n  build:\n    steps:\n      - uses: someone/tool@v1\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/repos/me/app/contents/.forgejo%2Fworkflows",
+			"/api/v1/repos/me/app/contents/.forgejo/workflows":
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"name": "ci.yml", "path": ".forgejo/workflows/ci.yml", "type": "file"},
+			})
+		case "/api/v1/repos/me/app/contents/.forgejo%2Fworkflows%2Fci.yml",
+			"/api/v1/repos/me/app/contents/.forgejo/workflows/ci.yml":
+			fmt.Fprintf(w, `{"name":"ci.yml","path":".forgejo/workflows/ci.yml","type":"file","encoding":"base64","content":%q}`,
+				base64.StdEncoding.EncodeToString([]byte(workflow)))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	client := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", prefix: "token ", client: srv.Client()}
+	repo := giteaRepo{FullName: "me/app", DefaultBranch: "main"}
+	repo.Owner.Login = "me"
+	repo.Name = "app"
+
+	files, err := listGiteaWorkflowFiles(context.Background(), client, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := files[".forgejo/workflows/ci.yml"]; !ok || len(files) != 1 {
+		t.Fatalf("files = %v, want the .forgejo/workflows workflow", files)
+	}
+}
+
+func TestGitLabPipelineSupplyChainSkipsWithoutDefaultBranch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("no API call expected for empty default branch, got %s", r.URL.Path)
+	}))
+	defer srv.Close()
+	client := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", prefix: "Bearer ", client: srv.Client()}
+	row := auditGitLabPipelineSupplyChain(context.Background(), client, gitlabProject{ID: 1, PathWithNamespace: "g/p"})
+	if row.Status != string(StatusSkipped) || !strings.Contains(row.Detail, "no default branch") {
+		t.Fatalf("empty project: status=%s detail=%q, want skipped", row.Status, row.Detail)
+	}
+}
+
+func TestGitLabPipelineSupplyChainFlagsUnparseableYAML(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "{{ not yaml")
+	}))
+	defer srv.Close()
+	client := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", prefix: "Bearer ", client: srv.Client()}
+	p := gitlabProject{ID: 1, PathWithNamespace: "g/p", DefaultBranch: "main"}
+	row := auditGitLabPipelineSupplyChain(context.Background(), client, p)
+	if row.Status != string(StatusGap) || !strings.Contains(row.Detail, "unparseable") {
+		t.Fatalf("broken pipeline YAML: status=%s detail=%q, want gap", row.Status, row.Detail)
+	}
+	if _, err := gitlabPipelineFindings("{{ not yaml"); err == nil {
+		t.Fatal("gitlabPipelineFindings must reject invalid YAML")
+	}
+}
+
+func TestGiteaWorkflowSupplyChainRowErrorClassification(t *testing.T) {
+	unavailable := func() (map[string]string, error) {
+		return nil, &restError{method: "GET", path: "/x", statusCode: http.StatusForbidden, status: "403"}
+	}
+	row := giteaWorkflowSupplyChainRow("gitea", "me/app", "workflow-unpinned-actions", "t", "medium", "gap: ", "clean", "rem", unavailable, workflowUnpinnedUses)
+	if row.Status != string(StatusSkipped) {
+		t.Fatalf("403 fetch: status=%s, want skipped", row.Status)
+	}
+	failing := func() (map[string]string, error) {
+		return nil, &restError{method: "GET", path: "/x", statusCode: http.StatusInternalServerError, status: "500"}
+	}
+	row = giteaWorkflowSupplyChainRow("gitea", "me/app", "workflow-unpinned-actions", "t", "medium", "gap: ", "clean", "rem", failing, workflowUnpinnedUses)
+	if row.Status != string(StatusError) {
+		t.Fatalf("500 fetch: status=%s, want error", row.Status)
+	}
+}
+
+func TestAuditGitLabRequiredWorkflowsParsesConfiguration(t *testing.T) {
+	tests := []struct {
+		name, content string
+		want          ControlStatus
+	}{
+		{"job", "stages: [test]\ntest:\n  script: echo ok\n", StatusCompliant},
+		{"include only", "include:\n  - local: ci/base.yml\n", StatusCompliant},
+		{"empty", "", StatusGap},
+		{"comment only", "# intentionally empty\n", StatusGap},
+		{"empty mapping", "{}\n", StatusGap},
+		{"scalar", "hello\n", StatusGap},
+		{"sequence", "- test\n", StatusGap},
+		{"multiple documents", "stages: [test]\n---\ntest:\n  script: echo ok\n", StatusGap},
+		{"malformed", "jobs: [\n", StatusGap},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got := r.URL.Query().Get("ref"); got != "main" {
+					t.Errorf("ref=%q, want main", got)
+				}
+				_, _ = w.Write([]byte(test.content))
+			}))
+			defer srv.Close()
+			client := &restClient{baseURL: srv.URL, token: "t", header: "PRIVATE-TOKEN", client: srv.Client()}
+			project := gitlabProject{ID: 1, PathWithNamespace: "group/app", DefaultBranch: "main"}
+			row := auditGitLabRequiredWorkflows(context.Background(), client, project)
+			if row.Status != string(test.want) {
+				t.Fatalf("status=%s detail=%q, want %s", row.Status, row.Detail, test.want)
+			}
+		})
+	}
+}
+
+func TestValidateGiteaWorkflowRequiresTriggerAndExecutableJob(t *testing.T) {
+	tests := []struct {
+		name, content string
+		valid         bool
+	}{
+		{"normal job", "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n", true},
+		{"reusable job", "on: workflow_dispatch\njobs:\n  shared:\n    uses: owner/repo/.gitea/workflows/build.yml@main\n", true},
+		{"missing trigger", "jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n", false},
+		{"empty trigger", "on: []\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n", false},
+		{"missing jobs", "on: push\n", false},
+		{"empty jobs", "on: push\njobs: {}\n", false},
+		{"non-executable job", "on: push\njobs:\n  build:\n    name: Build\n", false},
+		{"multiple documents", "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n---\non: pull_request\n", false},
+		{"malformed", "on: [push\n", false},
+		{"empty", "", false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateGiteaWorkflow(test.content)
+			if (err == nil) != test.valid {
+				t.Fatalf("err=%v, valid=%t", err, test.valid)
+			}
+		})
+	}
+}
+
+func TestAuditGiteaWorkflowsRequiresAtLeastOneValidFile(t *testing.T) {
+	validWorkflow := "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
+	for _, test := range []struct {
+		name     string
+		contents []string
+		want     ControlStatus
+	}{
+		{"only empty file", []string{""}, StatusGap},
+		{"only invalid file", []string{"on: push\njobs: {}\n"}, StatusGap},
+		{"valid and invalid files", []string{"# empty\n", validWorkflow}, StatusCompliant},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/contents/.gitea/workflows") {
+					entries := make([]map[string]string, 0, len(test.contents))
+					for i := range test.contents {
+						name := "ci" + string(rune('a'+i)) + ".yml"
+						entries = append(entries, map[string]string{"name": name, "path": ".gitea/workflows/" + name, "type": "file"})
+					}
+					_ = json.NewEncoder(w).Encode(entries)
+					return
+				}
+				for i, content := range test.contents {
+					name := "ci" + string(rune('a'+i)) + ".yml"
+					if strings.HasSuffix(r.URL.Path, "/contents/.gitea/workflows/"+name) {
+						_ = json.NewEncoder(w).Encode(map[string]string{
+							"name": name, "path": ".gitea/workflows/" + name, "type": "file",
+							"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(content)),
+						})
+						return
+					}
+				}
+				http.NotFound(w, r)
+			}))
+			defer srv.Close()
+			client := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", prefix: "token ", client: srv.Client()}
+			repo := giteaRepo{FullName: "me/app", DefaultBranch: "main"}
+			row := giteaWorkflowsRowForTest(client, repo)
+			if row.Status != string(test.want) {
+				t.Fatalf("status=%s detail=%q, want %s", row.Status, row.Detail, test.want)
+			}
+		})
 	}
 }

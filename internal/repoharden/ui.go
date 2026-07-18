@@ -28,12 +28,13 @@ const banner = `                       _                _
         |_|`
 
 func printUsageBanner(w io.Writer) {
-	fmt.Fprintln(w, colorize(nil, colorGo, banner))
-	fmt.Fprintln(w, colorize(nil, colorGray, "  one command · every repo · reversible"))
+	fmt.Fprintln(w, colorizeFor(w, nil, colorGo, banner))
+	fmt.Fprintln(w, colorizeFor(w, nil, colorGray, "  one command · every repo · reversible"))
 	fmt.Fprintln(w)
 }
 
-// sanitizeDetail removes terminal control sequences from untrusted output while preserving UTF-8 bytes.
+// sanitizeDetail removes terminal control sequences and invisible Unicode format
+// controls from untrusted output while preserving ordinary UTF-8 text.
 func sanitizeDetail(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
@@ -74,7 +75,7 @@ func sanitizeDetail(s string) string {
 	}
 	var clean strings.Builder
 	for _, r := range b.String() {
-		if unicode.IsControl(r) {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
 			continue
 		}
 		clean.WriteRune(r)
@@ -83,7 +84,7 @@ func sanitizeDetail(s string) string {
 }
 
 func maybePrintBanner(o *opts) {
-	if o != nil && (o.jsonOut || o.format == "json" || o.format == "sarif" || o.format == "markdown") {
+	if o != nil && (o.jsonOut || o.format == "json" || o.format == "sarif" || o.format == "markdown" || o.format == "badge") {
 		return
 	}
 	info, err := os.Stdout.Stat()
@@ -104,7 +105,15 @@ func validateColorMode(mode string) error {
 }
 
 func useColor(o *opts) bool {
-	if o != nil && (o.jsonOut || o.noColor) {
+	if o != nil && o.jsonOut {
+		return false
+	}
+	return useColorFor(o, os.Stdout)
+}
+
+// useColorFor decides color per stream: stdout and stderr can differ under redirection.
+func useColorFor(o *opts, f *os.File) bool {
+	if o != nil && o.noColor {
 		return false
 	}
 	mode := "auto"
@@ -120,7 +129,7 @@ func useColor(o *opts) bool {
 	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
 		return false
 	}
-	info, err := os.Stdout.Stat()
+	info, err := f.Stat()
 	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
@@ -129,6 +138,24 @@ func colorize(o *opts, color, s string) string {
 		return s
 	}
 	return color + s + colorReset
+}
+
+func colorizeErr(o *opts, color, s string) string {
+	if !useColorFor(o, os.Stderr) {
+		return s
+	}
+	return color + s + colorReset
+}
+
+func colorizeFor(w io.Writer, o *opts, color, s string) string {
+	switch w {
+	case os.Stdout:
+		return colorize(o, color, s)
+	case os.Stderr:
+		return colorizeErr(o, color, s)
+	default:
+		return s
+	}
 }
 
 func statusLabel(o *opts, status string) string {
@@ -172,15 +199,24 @@ func workflowStateLabel(o *opts, state string) string {
 }
 
 func actionLabel(o *opts, action string) string {
+	return actionLabelColor(colorize, o, action)
+}
+
+// actionLabelErr is actionLabel for text written to stderr.
+func actionLabelErr(o *opts, action string) string {
+	return actionLabelColor(colorizeErr, o, action)
+}
+
+func actionLabelColor(paint func(*opts, string, string) string, o *opts, action string) string {
 	switch action {
 	case "harden", "enable":
-		return colorize(o, colorCyan, action)
+		return paint(o, colorCyan, action)
 	case "disable", "revert":
-		return colorize(o, colorYellow, action)
+		return paint(o, colorYellow, action)
 	case "skip":
-		return colorize(o, colorGray, action)
+		return paint(o, colorGray, action)
 	case "ERROR", "FAILED":
-		return colorize(o, colorRed, action)
+		return paint(o, colorRed, action)
 	default:
 		return action
 	}

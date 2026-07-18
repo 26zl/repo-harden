@@ -39,6 +39,9 @@ func (r *hardenRecorder) record(e HardenEntry) (wasNew bool, err error) {
 			if existing.Prior == e.Prior && existing.Phase == HardenPhasePending {
 				return false, nil
 			}
+			if existing.Prior != e.Prior && (existing.Phase == HardenPhasePending || existing.Phase == HardenPhaseUnknown) {
+				return false, fmt.Errorf("refusing to replace ambiguous %s harden state for %s on %s; reconcile or revert it first", existing.Phase, e.Control, e.Repo)
+			}
 			prev := r.entries[i]
 			r.entries[i] = e
 			if err := saveHardenState(r.path, r.scope, r.entries); err != nil {
@@ -99,6 +102,16 @@ func collectHarden(ctx context.Context, c *github.Client, o *opts, repos []*gith
 	if err != nil {
 		return 0, 0, 0, err
 	}
+	applicable := false
+	for _, ctl := range controls {
+		if ctl.Apply != nil {
+			applicable = true
+			break
+		}
+	}
+	if !applicable {
+		return 0, 0, 0, usageErr("the selected controls are report-only; harden has nothing to apply")
+	}
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(o.concurrency)
@@ -122,7 +135,7 @@ func collectHarden(ctx context.Context, c *github.Client, o *opts, repos []*gith
 				case StatusError:
 					mu.Lock()
 					failed++
-					fmt.Fprintf(os.Stderr, "  %s %s :: %s: %s\n", actionLabel(o, "ERROR"), r.GetFullName(), ctl.Key, sanitizeDetail(res.Detail))
+					fmt.Fprintf(os.Stderr, "  %s %s :: %s: %s\n", actionLabelErr(o, "ERROR"), r.GetFullName(), ctl.Key, sanitizeDetail(res.Detail))
 					mu.Unlock()
 					continue
 				}
@@ -146,49 +159,60 @@ func collectHarden(ctx context.Context, c *github.Client, o *opts, repos []*gith
 				if rerr != nil {
 					mu.Lock()
 					failed++
-					fmt.Fprintf(os.Stderr, "  %s %s :: %s: save state before apply: %v\n", actionLabel(o, "FAILED"), r.GetFullName(), ctl.Key, rerr)
+					fmt.Fprintf(os.Stderr, "  %s %s :: %s: save state before apply: %v\n", actionLabelErr(o, "FAILED"), r.GetFullName(), ctl.Key, rerr)
 					mu.Unlock()
 					continue
 				}
-				if err := ctl.Apply(gctx, c, owner, name); err != nil {
-					after := ctl.Detect(gctx, c, owner, name, r)
+				applyErr := ctl.Apply(gctx, c, owner, name)
+				after := ctl.Detect(gctx, c, owner, name, r)
+				if applyErr == nil && matchesHardenedState(ctl, after, entry.Prior) {
+					if err := recorder.setPhase(entry, HardenPhaseApplied); err != nil {
+						mu.Lock()
+						failed++
+						fmt.Fprintf(os.Stderr, "  %s %s :: %s: mutation verified but state update failed: %v\n", actionLabelErr(o, "FAILED"), r.GetFullName(), ctl.Key, err)
+						mu.Unlock()
+						continue
+					}
+					mu.Lock()
+					applied++
+					mu.Unlock()
+					continue
+				}
+				if applyErr == nil {
+					applyErr = fmt.Errorf("post-apply verification failed (%s: %s)", after.Status, sanitizeDetail(after.Detail))
+				}
+				{
 					switch {
-					case after.Status == StatusCompliant:
+					case matchesHardenedState(ctl, after, entry.Prior):
 						if serr := recorder.setPhase(entry, HardenPhaseApplied); serr != nil {
-							err = errors.Join(err, fmt.Errorf("mark applied state: %w", serr))
+							applyErr = errors.Join(applyErr, fmt.Errorf("mark applied state: %w", serr))
 						}
-					case after.Status == StatusGap && after.Prior == entry.Prior:
+					case priorStateRestored(after, entry.Prior):
 						if serr := recorder.remove(entry); serr != nil {
-							err = errors.Join(err, fmt.Errorf("remove unchanged pending state: %w", serr))
+							applyErr = errors.Join(applyErr, fmt.Errorf("remove unchanged pending state: %w", serr))
 						}
 					case after.Status == StatusGap:
 						if rerr := ctl.Revert(gctx, c, owner, name, entry.Prior); rerr == nil {
-							if serr := recorder.remove(entry); serr != nil {
-								err = errors.Join(err, fmt.Errorf("remove compensated state: %w", serr))
+							restored := ctl.Detect(gctx, c, owner, name, r)
+							if !priorStateRestored(restored, entry.Prior) {
+								_ = recorder.setPhase(entry, HardenPhaseUnknown)
+								applyErr = errors.Join(applyErr, fmt.Errorf("compensating rollback could not be verified (%s: %s)", restored.Status, sanitizeDetail(restored.Detail)))
+							} else if serr := recorder.remove(entry); serr != nil {
+								applyErr = errors.Join(applyErr, fmt.Errorf("remove compensated state: %w", serr))
 							}
 						} else {
 							_ = recorder.setPhase(entry, HardenPhaseUnknown)
-							err = errors.Join(err, fmt.Errorf("compensating rollback failed: %w", rerr))
+							applyErr = errors.Join(applyErr, fmt.Errorf("compensating rollback failed: %w", rerr))
 						}
 					default:
 						_ = recorder.setPhase(entry, HardenPhaseUnknown)
 					}
 					mu.Lock()
 					failed++
-					fmt.Fprintf(os.Stderr, "  %s %s :: %s: %s\n", actionLabel(o, "FAILED"), r.GetFullName(), ctl.Key, sanitizeDetail(err.Error()))
+					fmt.Fprintf(os.Stderr, "  %s %s :: %s: %s\n", actionLabelErr(o, "FAILED"), r.GetFullName(), ctl.Key, sanitizeDetail(applyErr.Error()))
 					mu.Unlock()
 					continue
 				}
-				if err := recorder.setPhase(entry, HardenPhaseApplied); err != nil {
-					mu.Lock()
-					failed++
-					fmt.Fprintf(os.Stderr, "  %s %s :: %s: mutation succeeded but state update failed: %v\n", actionLabel(o, "FAILED"), r.GetFullName(), ctl.Key, err)
-					mu.Unlock()
-					continue
-				}
-				mu.Lock()
-				applied++
-				mu.Unlock()
 			}
 			return nil
 		})
@@ -275,11 +299,18 @@ func controlMap() map[string]Control {
 	return m
 }
 
-func matchesHardenedState(ctl Control, result DetectResult) bool {
+func matchesHardenedState(ctl Control, result DetectResult, prior string) bool {
 	if ctl.MatchesHardened != nil {
-		return ctl.MatchesHardened(result)
+		return ctl.MatchesHardened(result, prior)
 	}
 	return result.Status == StatusCompliant
+}
+
+func priorStateRestored(result DetectResult, prior string) bool {
+	if result.Status == StatusGap {
+		return result.Prior == prior
+	}
+	return result.Status == StatusCompliant && prior != "" && result.Prior == prior
 }
 
 func revertEntries(ctx context.Context, c *github.Client, o *opts, entries []HardenEntry) []HardenEntry {
@@ -299,7 +330,7 @@ func revertEntries(ctx context.Context, c *github.Client, o *opts, entries []Har
 			if !ok || ctl.Revert == nil {
 				mu.Lock()
 				remaining = append(remaining, e)
-				fmt.Fprintf(os.Stderr, "  %s unknown/report-only control %q\n", actionLabel(o, "skip"), e.Control)
+				fmt.Fprintf(os.Stderr, "  %s unknown/report-only control %q\n", actionLabelErr(o, "skip"), e.Control)
 				mu.Unlock()
 				return nil
 			}
@@ -307,7 +338,7 @@ func revertEntries(ctx context.Context, c *github.Client, o *opts, entries []Har
 			if err != nil {
 				mu.Lock()
 				remaining = append(remaining, e)
-				fmt.Fprintf(os.Stderr, "  %s %s :: %s: verify live state before revert: %s\n", actionLabel(o, "FAILED"), e.Repo, e.Control, sanitizeDetail(err.Error()))
+				fmt.Fprintf(os.Stderr, "  %s %s :: %s: verify live state before revert: %s\n", actionLabelErr(o, "FAILED"), e.Repo, e.Control, sanitizeDetail(err.Error()))
 				mu.Unlock()
 				return nil
 			}
@@ -315,11 +346,19 @@ func revertEntries(ctx context.Context, c *github.Client, o *opts, entries []Har
 			if current.Status == StatusGap && current.Prior == e.Prior {
 				return nil
 			}
-			if !matchesHardenedState(ctl, current) {
+			if e.Phase != HardenPhaseApplied {
+				mu.Lock()
+				remaining = append(remaining, e)
+				fmt.Fprintf(os.Stderr, "  %s %s :: %s: recorded as %s, never verified applied; refusing to revert an ambiguous change\n",
+					actionLabelErr(o, "skip"), e.Repo, e.Control, e.Phase)
+				mu.Unlock()
+				return nil
+			}
+			if !matchesHardenedState(ctl, current, e.Prior) {
 				mu.Lock()
 				remaining = append(remaining, e)
 				fmt.Fprintf(os.Stderr, "  %s %s :: %s: live setting drifted; refusing to overwrite it (%s: %s)\n",
-					actionLabel(o, "FAILED"), e.Repo, e.Control, current.Status, sanitizeDetail(current.Detail))
+					actionLabelErr(o, "FAILED"), e.Repo, e.Control, current.Status, sanitizeDetail(current.Detail))
 				mu.Unlock()
 				return nil
 			}
@@ -327,10 +366,16 @@ func revertEntries(ctx context.Context, c *github.Client, o *opts, entries []Har
 				return nil
 			}
 			err = ctl.Revert(gctx, c, owner, name, e.Prior)
+			if err == nil {
+				after := ctl.Detect(gctx, c, owner, name, repo)
+				if !priorStateRestored(after, e.Prior) {
+					err = fmt.Errorf("post-revert verification failed (%s: %s)", after.Status, sanitizeDetail(after.Detail))
+				}
+			}
 			mu.Lock()
 			if err != nil {
 				remaining = append(remaining, e)
-				fmt.Fprintf(os.Stderr, "  %s %s :: %s: %s\n", actionLabel(o, "FAILED"), e.Repo, e.Control, sanitizeDetail(err.Error()))
+				fmt.Fprintf(os.Stderr, "  %s %s :: %s: %s\n", actionLabelErr(o, "FAILED"), e.Repo, e.Control, sanitizeDetail(err.Error()))
 			}
 			mu.Unlock()
 			return nil
@@ -345,7 +390,15 @@ func cmdRevert(ctx context.Context, c *github.Client, o *opts) error {
 	if err := validateControlSelection(o.only, o.skip); err != nil {
 		return usageError{err}
 	}
-	path, err := hardenStateFilePath(o)
+	var (
+		path string
+		err  error
+	)
+	if o.dryRun {
+		path, err = hardenStateFilePathReadOnly(o)
+	} else {
+		path, err = hardenStateFilePath(o)
+	}
 	if err != nil {
 		return err
 	}
@@ -353,11 +406,13 @@ func cmdRevert(ctx context.Context, c *github.Client, o *opts) error {
 	if err != nil {
 		return err
 	}
-	unlock, err := lockStateFile(ctx, path)
-	if err != nil {
-		return err
+	if !o.dryRun {
+		unlock, err := lockStateFile(ctx, path)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = unlock() }()
 	}
-	defer func() { _ = unlock() }()
 	entries, err := loadHardenState(path, scope)
 	if err != nil {
 		return err

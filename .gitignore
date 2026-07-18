@@ -1,5 +1,6 @@
 # Binary
 /repo-harden
+/dist/
 
 # Go test artefacts
 *.test
