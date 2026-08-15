@@ -3,7 +3,7 @@
 > **Audit, harden, and manage your repositories — from one static binary.**
 > Read-only security posture across **GitHub, GitLab, Gitea & Forgejo** · reversible GitHub hardening · bulk GitHub Actions control.
 
-[![CI](https://github.com/26zl/repo-harden/actions/workflows/ci.yml/badge.svg)](https://github.com/26zl/repo-harden/actions/workflows/ci.yml) [![Go Reference](https://pkg.go.dev/badge/github.com/26zl/repo-harden.svg)](https://pkg.go.dev/github.com/26zl/repo-harden) ![Go 1.25.12+](https://img.shields.io/badge/Go-1.25.12%2B-00ADD8?logo=go&logoColor=white) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/26zl/repo-harden/actions/workflows/ci.yml/badge.svg)](https://github.com/26zl/repo-harden/actions/workflows/ci.yml) [![Go Reference](https://pkg.go.dev/badge/github.com/26zl/repo-harden.svg)](https://pkg.go.dev/github.com/26zl/repo-harden) ![Go 1.25.13+](https://img.shields.io/badge/Go-1.25.13%2B-00ADD8?logo=go&logoColor=white) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ```text
                        _                _
@@ -237,7 +237,7 @@ history.
 
 ## Requirements & install
 
-- Go 1.25.12+ (declared in `go.mod`; with the default `GOTOOLCHAIN=auto` the right toolchain is fetched automatically)
+- Go 1.25.13+ (declared in `go.mod`; with the default `GOTOOLCHAIN=auto` the right toolchain is fetched automatically)
 - A token for the forge you target: [`gh`](https://cli.github.com/) logged in (`gh auth login`) or `GITHUB_TOKEN`; `GITLAB_TOKEN` / `GITEA_TOKEN` / `FORGEJO_TOKEN` (Forgejo falls back to `GITEA_TOKEN`) / `BITBUCKET_TOKEN` for those providers
 
 Use the least-privilege token that covers the commands you run:

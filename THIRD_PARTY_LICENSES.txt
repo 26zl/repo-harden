@@ -159,7 +159,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ==============================================================================
-Go standard library 1.25.12; golang.org/x/sync v0.22.0; golang.org/x/sys v0.44.0
+Go standard library 1.25.13; golang.org/x/sync v0.22.0; golang.org/x/sys v0.44.0
 ==============================================================================
 
 Copyright 2009 The Go Authors.
