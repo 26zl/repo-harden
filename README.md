@@ -74,11 +74,19 @@ The read-only `audit` runs beyond GitHub — point it at another forge with `--p
 | GitHub / GHES | ✅ full catalog | ✅ |
 | GitLab | ✅ portable subset + `pipeline-supply-chain` (unpinned images, floating includes) | — |
 | Gitea / Forgejo | ✅ portable subset + the workflow supply-chain checks (`.gitea`, `.forgejo`, and `.github` workflow dirs) | — |
+| Bitbucket Cloud | ✅ portable subset + `pipeline-supply-chain` (unpinned images and pipes in `bitbucket-pipelines.yml`) | — |
 
 ```bash
 repo-harden audit --provider gitlab                      # uses GITLAB_TOKEN
 repo-harden audit --provider gitea --host git.example.com # uses GITEA_TOKEN
+repo-harden audit --provider bitbucket --owner myworkspace # uses BITBUCKET_TOKEN
 ```
+
+Bitbucket support targets Bitbucket Cloud (`api.bitbucket.org`); Server/Data
+Center instances expose a different API and are not supported. Set
+`BITBUCKET_TOKEN` to a repository/project/workspace access token or OAuth
+bearer token, or to `email:api_token` for an Atlassian API token (sent as
+HTTP basic authentication).
 
 `harden`/`revert` and the Actions commands are GitHub-only by design: branch protection ports across forges, but the high-value scanning controls are GitHub-proprietary (or GitLab paid-tier), so a cross-forge `harden` would be mostly no-ops. `audit` gives the cross-forge visibility that matters.
 
@@ -100,7 +108,7 @@ would be overwritten.
 ## What the audit checks
 
 A best-effort baseline, not an exhaustive security review. GitHub gets the full
-catalog; GitLab, Gitea, and Forgejo get the portable subset. Inaccessible or
+catalog; GitLab, Gitea, Forgejo, and Bitbucket Cloud get the portable subset. Inaccessible or
 license-gated checks are `skipped`, never guessed. Use `--fail-on-skipped` when
 unverifiable results must fail CI.
 
@@ -230,7 +238,7 @@ history.
 ## Requirements & install
 
 - Go 1.25.12+ (declared in `go.mod`; with the default `GOTOOLCHAIN=auto` the right toolchain is fetched automatically)
-- A token for the forge you target: [`gh`](https://cli.github.com/) logged in (`gh auth login`) or `GITHUB_TOKEN`; `GITLAB_TOKEN` / `GITEA_TOKEN` / `FORGEJO_TOKEN` (Forgejo falls back to `GITEA_TOKEN`) for those providers
+- A token for the forge you target: [`gh`](https://cli.github.com/) logged in (`gh auth login`) or `GITHUB_TOKEN`; `GITLAB_TOKEN` / `GITEA_TOKEN` / `FORGEJO_TOKEN` (Forgejo falls back to `GITEA_TOKEN`) / `BITBUCKET_TOKEN` for those providers
 
 Use the least-privilege token that covers the commands you run:
 

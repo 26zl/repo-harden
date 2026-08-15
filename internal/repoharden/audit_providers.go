@@ -3,6 +3,7 @@ package repoharden
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
@@ -370,6 +371,190 @@ func listGiteaRepos(ctx context.Context, c *restClient, o *opts) ([]giteaRepo, e
 func giteaRepoParts(repo giteaRepo) (string, string) {
 	owner, name := splitRepo(repo.FullName)
 	return owner, name
+}
+
+type bitbucketRepo struct {
+	FullName   string    `json:"full_name"`
+	IsPrivate  bool      `json:"is_private"`
+	UpdatedOn  time.Time `json:"updated_on"`
+	Parent     *struct{} `json:"parent"`
+	Mainbranch *struct {
+		Name string `json:"name"`
+	} `json:"mainbranch"`
+}
+
+func bitbucketDefaultBranch(repo bitbucketRepo) string {
+	if repo.Mainbranch == nil {
+		return ""
+	}
+	return strings.TrimSpace(repo.Mainbranch.Name)
+}
+
+func bitbucketRepoPath(repo bitbucketRepo, suffix string) string {
+	owner, name := splitRepo(repo.FullName)
+	return "/2.0/repositories/" + escapedPath(owner, name) + suffix
+}
+
+// bitbucketSrcRef returns a ref usable in src paths: the src endpoint splits
+// {commit} at the first slash, so slashed branch names must be resolved to a
+// commit hash via the refs endpoint first.
+func bitbucketSrcRef(ctx context.Context, c *restClient, repo bitbucketRepo) (string, error) {
+	branch := bitbucketDefaultBranch(repo)
+	if !strings.Contains(branch, "/") {
+		return branch, nil
+	}
+	var out struct {
+		Target struct {
+			Hash string `json:"hash"`
+		} `json:"target"`
+	}
+	if _, err := c.get(ctx, bitbucketRepoPath(repo, "/refs/branches/"+escapedFilePath(branch)), nil, &out); err != nil {
+		return "", err
+	}
+	hash := strings.TrimSpace(out.Target.Hash)
+	if hash == "" {
+		return "", fmt.Errorf("branch %s did not resolve to a commit hash", branch)
+	}
+	return hash, nil
+}
+
+func collectBitbucketAudit(ctx context.Context, o *opts) ([]auditRow, []string, error) {
+	client, err := newRestClient("bitbucket", o)
+	if err != nil {
+		return nil, nil, err
+	}
+	repos, header, err := listBitbucketRepos(ctx, client, o)
+	if err != nil {
+		return nil, nil, err
+	}
+	repositories := make([]string, 0, len(repos))
+	for _, repo := range repos {
+		repositories = append(repositories, repo.FullName)
+	}
+	sort.Strings(repositories)
+	want := wantFunc(o)
+	var rows []auditRow
+	if want("token-scopes") {
+		scopes := ""
+		if header != nil {
+			scopes = header.Get("X-Oauth-Scopes")
+		}
+		rows = append(rows, bitbucketTokenScopesRow(scopes))
+	}
+	var mu sync.Mutex
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(max(1, o.concurrency))
+	for _, repo := range repos {
+		group.Go(func() error {
+			if err := groupCtx.Err(); err != nil {
+				return err
+			}
+			var refOnce sync.Once
+			var ref string
+			var refErr error
+			srcRef := func() (string, error) {
+				refOnce.Do(func() { ref, refErr = bitbucketSrcRef(groupCtx, client, repo) })
+				return ref, refErr
+			}
+			getYML := bitbucketPipelinesYMLFetcher(groupCtx, client, repo, srcRef)
+			checks := []struct {
+				key string
+				run func() auditRow
+			}{
+				{"public-exposure", func() auditRow { return auditGenericVisibility("bitbucket", repo.FullName, !repo.IsPrivate) }},
+				{"stale-repo", func() auditRow { return auditGenericStale("bitbucket", repo.FullName, repo.UpdatedOn, o.staleDays) }},
+				{"default-branch", func() auditRow {
+					if bitbucketDefaultBranch(repo) == "" {
+						return providerRow("bitbucket", "repo", repo.FullName, "default-branch", "Default branch is set", "medium", StatusGap, "no default branch", "Set and protect the default branch.")
+					}
+					return providerRow("bitbucket", "repo", repo.FullName, "default-branch", "Default branch is set", "medium", StatusCompliant, "default branch: "+bitbucketDefaultBranch(repo), "Set and protect the default branch.")
+				}},
+				{"branch-protection-full", func() auditRow { return auditBitbucketBranchProtection(groupCtx, client, repo) }},
+				{"required-workflows", func() auditRow { return auditBitbucketRequiredWorkflows(groupCtx, client, repo, getYML) }},
+				{"pipeline-supply-chain", func() auditRow { return auditBitbucketPipelineSupplyChain(repo, getYML) }},
+				{"environment-protection", func() auditRow { return auditBitbucketEnvironments(groupCtx, client, repo) }},
+				{"repo-secrets", func() auditRow { return auditBitbucketVariables(groupCtx, client, repo, o.showIdentifiers) }},
+				{"deploy-keys", func() auditRow { return auditBitbucketDeployKeys(groupCtx, client, repo) }},
+				{"webhooks", func() auditRow { return auditBitbucketWebhooks(groupCtx, client, repo) }},
+				{"collaborators", func() auditRow { return auditBitbucketCollaborators(groupCtx, client, repo, o.showIdentifiers) }},
+				{"signed-commits", func() auditRow {
+					return providerRow("bitbucket", "repo", repo.FullName, "signed-commits", "Signed commits required", "medium", StatusSkipped, "requiring signed commits is a Premium UI setting without a REST API", "Enable required signed commits in repository settings (Premium).")
+				}},
+				{"vulnerability-alert-count", func() auditRow {
+					return providerRow("bitbucket", "repo", repo.FullName, "vulnerability-alert-count", "Vulnerability alerts are triaged", "high", StatusSkipped, "no native vulnerability alert API", "Run dependency scanning in Pipelines and review its reports.")
+				}},
+				{"releases", func() auditRow {
+					return providerRow("bitbucket", "repo", repo.FullName, "releases", "Releases are reviewed", "low", StatusSkipped, "Bitbucket Cloud has no releases; Downloads are mutable artifacts", "Publish immutable release artifacts from CI to a registry with provenance.")
+				}},
+				{"packages", func() auditRow {
+					return providerRow("bitbucket", "repo", repo.FullName, "packages", "Packages are inventoried", "low", StatusSkipped, "Bitbucket Packages has no REST API to audit", "Review package visibility in the workspace UI.")
+				}},
+				{"dependency-sbom", func() auditRow {
+					return providerRow("bitbucket", "repo", repo.FullName, "dependency-sbom", "Dependency SBOM is available", "medium", StatusSkipped, "no portable SBOM API found", "Generate SBOMs in CI.")
+				}},
+				{"repository-license", func() auditRow { return auditBitbucketRepositoryLicense(groupCtx, client, repo, srcRef) }},
+				{"archived-active-risk", func() auditRow {
+					return providerRow("bitbucket", "repo", repo.FullName, "archived-active-risk", "Archived repositories are reviewed", "low", StatusSkipped, "Bitbucket Cloud has no repository archiving", "Restrict or delete inactive repositories; archiving is unavailable.")
+				}},
+			}
+			var local []auditRow
+			for _, check := range checks {
+				if want(check.key) {
+					local = append(local, check.run())
+				}
+			}
+			mu.Lock()
+			rows = append(rows, local...)
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return rows, repositories, err
+	}
+	return rows, repositories, nil
+}
+
+func listBitbucketRepos(ctx context.Context, c *restClient, o *opts) ([]bitbucketRepo, http.Header, error) {
+	var workspaces []string
+	var header http.Header
+	if o.owner != "" {
+		workspaces = append(workspaces, o.owner)
+	} else {
+		list, h, err := bitbucketPaged[struct {
+			Slug string `json:"slug"`
+		}](ctx, c, "/2.0/workspaces", nil)
+		if err != nil {
+			return nil, nil, fmt.Errorf("listing workspaces failed (pass --owner <workspace> to audit a single workspace): %w", err)
+		}
+		header = h
+		for _, workspace := range list {
+			if slug := strings.TrimSpace(workspace.Slug); slug != "" {
+				workspaces = append(workspaces, slug)
+			}
+		}
+	}
+	extra := url.Values{}
+	if o.adminOnly {
+		extra.Set("role", "admin")
+	}
+	var all []bitbucketRepo
+	for _, workspace := range workspaces {
+		repos, h, err := bitbucketPaged[bitbucketRepo](ctx, c, "/2.0/repositories/"+url.PathEscape(workspace), extra)
+		if err != nil {
+			return nil, nil, err
+		}
+		if header == nil {
+			header = h
+		}
+		for _, repo := range repos {
+			if repo.Parent != nil && !o.includeForks {
+				continue
+			}
+			all = append(all, repo)
+		}
+	}
+	return all, header, nil
 }
 
 func giteaRepoPath(repo giteaRepo, suffix string) string {

@@ -142,6 +142,82 @@ func TestGiteaPagedValidatesLinkEvenWithTotalCount(t *testing.T) {
 	}
 }
 
+func TestBitbucketPagedFollowsNextURL(t *testing.T) {
+	var srvURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("page") {
+		case "":
+			fmt.Fprintf(w, `{"values":[{"x":1},{"x":2}],"next":%q}`, srvURL+"/x?page=2&pagelen=50")
+		case "2":
+			_, _ = w.Write([]byte(`{"values":[{"x":3}]}`))
+		default:
+			_, _ = w.Write([]byte(`{"values":[]}`))
+		}
+	}))
+	defer srv.Close()
+	srvURL = srv.URL
+	client := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", prefix: "Bearer ", client: srv.Client()}
+	got, _, err := bitbucketPaged[map[string]any](context.Background(), client, "/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d items across pages, want 3 (would have been 2 without following next)", len(got))
+	}
+}
+
+func TestBitbucketPagedHandlesPathPrefixedHost(t *testing.T) {
+	var srvURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/bitbucket/x":
+			if r.URL.Query().Get("page") == "2" {
+				_, _ = w.Write([]byte(`{"values":[{"x":2}]}`))
+				return
+			}
+			fmt.Fprintf(w, `{"values":[{"x":1}],"next":%q}`, srvURL+"/bitbucket/x?page=2")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	srvURL = srv.URL
+	client := &restClient{baseURL: srv.URL + "/bitbucket", token: "t", header: "Authorization", prefix: "Bearer ", client: srv.Client()}
+	got, _, err := bitbucketPaged[map[string]any](context.Background(), client, "/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d items, want 2 (next-page path must not double-prefix the base path)", len(got))
+	}
+}
+
+func TestBitbucketPagedRefusesCrossHostNext(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"values":[{"x":1}],"next":"https://evil.example/x?page=2"}`))
+	}))
+	defer srv.Close()
+	client := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", prefix: "Bearer ", client: srv.Client()}
+	if _, _, err := bitbucketPaged[map[string]any](context.Background(), client, "/x", nil); err == nil ||
+		!strings.Contains(err.Error(), "host") {
+		t.Fatalf("cross-host next URL must fail closed, got %v", err)
+	}
+}
+
+func TestBitbucketPagedRejectsNonAdvancingNext(t *testing.T) {
+	var srvURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"values":[{"x":1}],"next":%q}`, srvURL+"/x?page=2")
+	}))
+	defer srv.Close()
+	srvURL = srv.URL
+	client := &restClient{baseURL: srv.URL, token: "t", header: "Authorization", prefix: "Bearer ", client: srv.Client()}
+	if _, _, err := bitbucketPaged[map[string]any](context.Background(), client, "/x", nil); err == nil ||
+		!strings.Contains(err.Error(), "non-advancing") {
+		t.Fatalf("repeating next URL must fail closed, got %v", err)
+	}
+}
+
 func TestRestClientAuthPrefixes(t *testing.T) {
 	gitea, err := newRestClient("gitea", &opts{host: "https://gitea.local", token: "tok"})
 	if err != nil {
@@ -157,6 +233,21 @@ func TestRestClientAuthPrefixes(t *testing.T) {
 	}
 	if gitlab.header != "PRIVATE-TOKEN" || gitlab.prefix != "" {
 		t.Fatalf("gitlab auth = %q %q, want PRIVATE-TOKEN/empty", gitlab.header, gitlab.prefix)
+	}
+	bitbucket, err := newRestClient("bitbucket", &opts{host: "https://api.bitbucket.org", token: "tok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bitbucket.header != "Authorization" || bitbucket.prefix != "Bearer " {
+		t.Fatalf("bitbucket auth = %q %q, want Authorization/Bearer", bitbucket.header, bitbucket.prefix)
+	}
+	basic, err := newRestClient("bitbucket", &opts{host: "https://api.bitbucket.org", token: "audit@example.com:tok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBasic := base64.StdEncoding.EncodeToString([]byte("audit@example.com:tok"))
+	if basic.prefix != "Basic " || basic.token != wantBasic {
+		t.Fatalf("bitbucket email:token auth = %q %q, want Basic with base64 credentials", basic.prefix, basic.token)
 	}
 	if gitea.client.Timeout != 30*time.Second {
 		t.Fatalf("rest client timeout = %s, want 30s", gitea.client.Timeout)

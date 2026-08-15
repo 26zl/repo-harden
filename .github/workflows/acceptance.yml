@@ -7,7 +7,7 @@ on:
         description: Forge to test
         required: true
         type: choice
-        options: [github, gitlab, gitea, forgejo]
+        options: [github, gitlab, gitea, forgejo, bitbucket]
       host:
         description: Forge host or URL
         required: true
@@ -51,10 +51,10 @@ jobs:
           HOST: ${{ inputs.host }}
           OWNER: ${{ inputs.owner }}
           REPOSITORY: ${{ inputs.repository }}
-          TOKEN: ${{ inputs.provider == 'github' && secrets.ACCEPTANCE_GITHUB_TOKEN || inputs.provider == 'gitlab' && secrets.ACCEPTANCE_GITLAB_TOKEN || inputs.provider == 'gitea' && secrets.ACCEPTANCE_GITEA_TOKEN || inputs.provider == 'forgejo' && secrets.ACCEPTANCE_FORGEJO_TOKEN }}
+          TOKEN: ${{ inputs.provider == 'github' && secrets.ACCEPTANCE_GITHUB_TOKEN || inputs.provider == 'gitlab' && secrets.ACCEPTANCE_GITLAB_TOKEN || inputs.provider == 'gitea' && secrets.ACCEPTANCE_GITEA_TOKEN || inputs.provider == 'forgejo' && secrets.ACCEPTANCE_FORGEJO_TOKEN || inputs.provider == 'bitbucket' && secrets.ACCEPTANCE_BITBUCKET_TOKEN }}
         run: |
           case "$PROVIDER" in
-            github|gitlab|gitea|forgejo) ;;
+            github|gitlab|gitea|forgejo|bitbucket) ;;
             *) echo "unsupported provider" >&2; exit 2 ;;
           esac
           test -n "$TOKEN" && test "$TOKEN" != "false"
@@ -70,10 +70,10 @@ jobs:
           HOST: ${{ inputs.host }}
           OWNER: ${{ inputs.owner }}
           REPOSITORY: ${{ inputs.repository }}
-          TOKEN: ${{ inputs.provider == 'github' && secrets.ACCEPTANCE_GITHUB_TOKEN || inputs.provider == 'gitlab' && secrets.ACCEPTANCE_GITLAB_TOKEN || inputs.provider == 'gitea' && secrets.ACCEPTANCE_GITEA_TOKEN || inputs.provider == 'forgejo' && secrets.ACCEPTANCE_FORGEJO_TOKEN }}
+          TOKEN: ${{ inputs.provider == 'github' && secrets.ACCEPTANCE_GITHUB_TOKEN || inputs.provider == 'gitlab' && secrets.ACCEPTANCE_GITLAB_TOKEN || inputs.provider == 'gitea' && secrets.ACCEPTANCE_GITEA_TOKEN || inputs.provider == 'forgejo' && secrets.ACCEPTANCE_FORGEJO_TOKEN || inputs.provider == 'bitbucket' && secrets.ACCEPTANCE_BITBUCKET_TOKEN }}
         run: |
           case "$PROVIDER" in
-            github|gitlab|gitea|forgejo) ;;
+            github|gitlab|gitea|forgejo|bitbucket) ;;
             *) echo "unsupported provider" >&2; exit 2 ;;
           esac
           test -n "$TOKEN" && test "$TOKEN" != "false"

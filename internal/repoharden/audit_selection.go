@@ -97,7 +97,7 @@ func providerAuditControlKeys(provider string) map[string]bool {
 	}
 	keys := map[string]bool{}
 	switch provider {
-	case "gitlab":
+	case "gitlab", "bitbucket":
 		keys["pipeline-supply-chain"] = true
 	case "gitea", "forgejo":
 		keys["workflow-unpinned-actions"] = true

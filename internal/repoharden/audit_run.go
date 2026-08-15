@@ -32,6 +32,9 @@ func runAudit(ctx context.Context, c *github.Client, o *opts) ([]auditRow, []str
 	case "gitea", "forgejo":
 		rows, repositories, err := collectGiteaAudit(ctx, o)
 		return filterAuditRows(rows, o), repositories, err
+	case "bitbucket":
+		rows, repositories, err := collectBitbucketAudit(ctx, o)
+		return filterAuditRows(rows, o), repositories, err
 	default:
 		return nil, nil, fmt.Errorf("unsupported provider %q", o.provider)
 	}

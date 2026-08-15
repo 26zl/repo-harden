@@ -235,6 +235,13 @@ func TestValidateAuditSelectionRejectsUnsupportedProviderControl(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "unsupported by provider gitlab") {
 		t.Fatalf("unsupported provider control should fail, got %v", err)
 	}
+	if err := validateAuditSelectionForProvider("bitbucket", "pipeline-supply-chain", ""); err != nil {
+		t.Fatalf("pipeline-supply-chain should be selectable for bitbucket: %v", err)
+	}
+	if err := validateAuditSelectionForProvider("bitbucket", "workflow-unpinned-actions", ""); err == nil ||
+		!strings.Contains(err.Error(), "unsupported by provider bitbucket") {
+		t.Fatalf("workflow-unpinned-actions must be rejected for bitbucket, got %v", err)
+	}
 	if err := validateAuditSelectionForProvider("gitlab", "branch-protection-full", ""); err != nil {
 		t.Fatalf("supported GitLab control rejected: %v", err)
 	}

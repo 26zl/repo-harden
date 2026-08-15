@@ -14,7 +14,7 @@
       "required": ["provider", "host", "repositories", "controls", "selection"],
       "properties": {
         "provider": {
-          "enum": ["github", "gitlab", "gitea", "forgejo"]
+          "enum": ["github", "gitlab", "gitea", "forgejo", "bitbucket"]
         },
         "host": { "type": "string", "minLength": 1 },
         "owner": { "type": "string" },
@@ -71,7 +71,7 @@
       "required": ["repo", "control", "status"],
       "properties": {
         "provider": {
-          "enum": ["github", "gitlab", "gitea", "forgejo"]
+          "enum": ["github", "gitlab", "gitea", "forgejo", "bitbucket"]
         },
         "scope": { "enum": ["repo", "org", "token"] },
         "repo": { "type": "string", "minLength": 1 },

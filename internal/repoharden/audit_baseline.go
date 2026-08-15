@@ -259,7 +259,7 @@ func validAuditSeverity(severity string) bool {
 
 func validAuditProvider(provider string) bool {
 	switch provider {
-	case "github", "gitlab", "gitea", "forgejo":
+	case "github", "gitlab", "gitea", "forgejo", "bitbucket":
 		return true
 	default:
 		return false

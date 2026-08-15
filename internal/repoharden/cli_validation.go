@@ -118,9 +118,9 @@ func normalizeOptions(o *opts) {
 
 func validateOptions(o *opts) error {
 	switch o.provider {
-	case "github", "gitlab", "gitea", "forgejo":
+	case "github", "gitlab", "gitea", "forgejo", "bitbucket":
 	default:
-		return fmt.Errorf("invalid --provider %q (expected github, gitlab, gitea, or forgejo)", o.provider)
+		return fmt.Errorf("invalid --provider %q (expected github, gitlab, gitea, forgejo, or bitbucket)", o.provider)
 	}
 	switch o.format {
 	case "table", "json", "markdown", "sarif", "badge":

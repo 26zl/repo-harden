@@ -17,6 +17,8 @@ func defaultProviderHost(provider string) string {
 		return "gitlab.com"
 	case "gitea", "forgejo":
 		return "http://localhost:3000"
+	case "bitbucket":
+		return "api.bitbucket.org"
 	default:
 		return "github.com"
 	}
@@ -30,6 +32,8 @@ func providerTokenEnvName(provider string) string {
 		return "GITEA_TOKEN"
 	case "forgejo":
 		return "FORGEJO_TOKEN (or GITEA_TOKEN)"
+	case "bitbucket":
+		return "BITBUCKET_TOKEN"
 	default:
 		return "GITHUB_TOKEN"
 	}
@@ -46,6 +50,8 @@ func tokenFromEnv(provider string) string {
 			return token
 		}
 		return os.Getenv("GITEA_TOKEN")
+	case "bitbucket":
+		return os.Getenv("BITBUCKET_TOKEN")
 	default:
 		return os.Getenv("GITHUB_TOKEN")
 	}
@@ -119,6 +125,13 @@ func providerBaseURL(provider, hostOrURL string) string {
 		raw = strings.TrimSuffix(raw, "/api/v4")
 	case "gitea", "forgejo":
 		raw = strings.TrimSuffix(raw, "/api/v1")
+	case "bitbucket":
+		raw = strings.TrimSuffix(raw, "/2.0")
+		// The web host serves no REST API; accept it as a shorthand for the API host.
+		if u, err := url.Parse(raw); err == nil && (u.Host == "bitbucket.org" || u.Host == "www.bitbucket.org") {
+			u.Host = "api.bitbucket.org"
+			raw = u.String()
+		}
 	}
 	return raw
 }

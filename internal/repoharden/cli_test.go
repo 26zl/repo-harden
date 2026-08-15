@@ -287,6 +287,17 @@ func TestProviderURLHelpers(t *testing.T) {
 	if got := providerBaseURL("gitea", ""); got != "http://localhost:3000" {
 		t.Fatalf("gitea default base URL = %q, want http://localhost:3000", got)
 	}
+	if got := providerBaseURL("bitbucket", ""); got != "https://api.bitbucket.org" {
+		t.Fatalf("bitbucket default base URL = %q, want https://api.bitbucket.org", got)
+	}
+	if got := providerBaseURL("bitbucket", "https://api.bitbucket.org/2.0"); got != "https://api.bitbucket.org" {
+		t.Fatalf("Bitbucket API URL was not normalized: %q", got)
+	}
+	for _, web := range []string{"bitbucket.org", "https://bitbucket.org", "https://www.bitbucket.org/"} {
+		if got := providerBaseURL("bitbucket", web); got != "https://api.bitbucket.org" {
+			t.Fatalf("Bitbucket web host %q must resolve to the API host, got %q", web, got)
+		}
+	}
 	api, upload := githubEnterpriseURLs("github.example.com")
 	if api != "https://github.example.com/api/v3/" || upload != "https://github.example.com/api/uploads/" {
 		t.Fatalf("enterprise urls = %q %q", api, upload)
@@ -432,6 +443,10 @@ func TestTokenFromEnv(t *testing.T) {
 	if got := tokenFromEnv("forgejo"); got != "fj" {
 		t.Fatalf("forgejo = %q, want fj", got)
 	}
+	t.Setenv("BITBUCKET_TOKEN", "bb")
+	if got := tokenFromEnv("bitbucket"); got != "bb" {
+		t.Fatalf("bitbucket = %q, want bb", got)
+	}
 }
 
 func TestResolveTokenPrefersFlagOverEnv(t *testing.T) {
@@ -471,6 +486,10 @@ func TestValidateOptions(t *testing.T) {
 	if err := validateOptions(ok); err != nil {
 		t.Fatalf("valid opts rejected: %v", err)
 	}
+	okBitbucket := &opts{provider: "bitbucket", format: "table", staleDays: 1, concurrency: 1}
+	if err := validateOptions(okBitbucket); err != nil {
+		t.Fatalf("bitbucket opts rejected: %v", err)
+	}
 	bad := []*opts{
 		{provider: "bogus", format: "table", staleDays: 1, concurrency: 1},
 		{provider: "github", format: "xml", staleDays: 1, concurrency: 1},
@@ -479,6 +498,7 @@ func TestValidateOptions(t *testing.T) {
 		{provider: "github", format: "table", staleDays: 1, concurrency: 0},
 		{provider: "github", format: "table", staleDays: 1, concurrency: maxConcurrency + 1},
 		{provider: "gitlab", format: "table", staleDays: 1, repo: "me/app", concurrency: 1},
+		{provider: "bitbucket", format: "table", staleDays: 1, repo: "me/app", concurrency: 1},
 	}
 	for i, o := range bad {
 		if err := validateOptions(o); err == nil {

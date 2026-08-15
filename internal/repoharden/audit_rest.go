@@ -3,6 +3,7 @@ package repoharden
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,6 +41,12 @@ func newRestClient(provider string, o *opts) (*restClient, error) {
 		prefix = ""
 	case "gitea", "forgejo":
 		prefix = "token "
+	case "bitbucket":
+		// Atlassian API tokens authenticate as Basic email:token; access and OAuth tokens as Bearer.
+		if strings.Contains(token, ":") {
+			prefix = "Basic "
+			token = base64.StdEncoding.EncodeToString([]byte(token))
+		}
 	}
 	base := providerBaseURL(provider, o.host)
 	if err := requireSecureURL(base); err != nil {

@@ -263,8 +263,8 @@ Options:
   --all                      audit table: show every check, not just gaps/errors
   --color <mode>             Color output: auto, always, never (default: auto)
   --no-color                 Disable color (same as --color never / NO_COLOR)
-  --provider <name>          audit provider: github, gitlab, gitea, forgejo
-  --host <host-or-url>       Provider host (GitHub Enterprise, GitLab, Gitea)
+  --provider <name>          audit provider: github, gitlab, gitea, forgejo, bitbucket
+  --host <host-or-url>       Provider host (GHES, GitLab, Gitea, Bitbucket)
   --token <token>            Provider token (discouraged: visible in ps/shell history;
                              prefer env vars, gh auth, or --token-stdin)
   --token-stdin              Read the provider token from stdin
@@ -290,6 +290,7 @@ Env:
   GITLAB_TOKEN               GitLab token fallback
   GITEA_TOKEN                Gitea token fallback
   FORGEJO_TOKEN              Forgejo token fallback (then GITEA_TOKEN)
+  BITBUCKET_TOKEN            Bitbucket Cloud access token, or email:api_token
 `)
 }
 

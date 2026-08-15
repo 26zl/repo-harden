@@ -106,6 +106,67 @@ func gitlabPaged[T any](ctx context.Context, c *restClient, path string, extra u
 	return nil, fmt.Errorf("gitlab pagination for %s exceeded %d pages", path, maxProviderPages)
 }
 
+// bitbucketPaged follows the {values, next} envelope and returns the first
+// response's header so callers can read credential metadata such as scopes.
+func bitbucketPaged[T any](ctx context.Context, c *restClient, path string, extra url.Values) ([]T, http.Header, error) {
+	var all []T
+	var firstHeader http.Header
+	query := url.Values{"pagelen": []string{"50"}}
+	for k, v := range extra {
+		query[k] = v
+	}
+	lastNext := ""
+	for requests := 1; requests <= maxProviderPages; requests++ {
+		var envelope struct {
+			Values []T    `json:"values"`
+			Next   string `json:"next"`
+		}
+		resp, err := c.get(ctx, path, query, &envelope)
+		if err != nil {
+			return nil, nil, err
+		}
+		if firstHeader == nil && resp != nil {
+			firstHeader = resp.Header
+		}
+		all = append(all, envelope.Values...)
+		next := strings.TrimSpace(envelope.Next)
+		if next == "" {
+			return all, firstHeader, nil
+		}
+		if next == lastNext {
+			return nil, nil, fmt.Errorf("non-advancing Bitbucket pagination next %q", next)
+		}
+		lastNext = next
+		path, query, err = bitbucketNextRequest(c.baseURL, next)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return nil, nil, fmt.Errorf("bitbucket pagination for %s exceeded %d pages", path, maxProviderPages)
+}
+
+// bitbucketNextRequest converts an absolute next-page URL into a same-host path and
+// query so the token is never sent to a host other than the API base.
+func bitbucketNextRequest(baseURL, next string) (string, url.Values, error) {
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return "", nil, err
+	}
+	u, err := url.Parse(next)
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid Bitbucket pagination next %q: %w", next, err)
+	}
+	if u.Scheme != base.Scheme || u.Host != base.Host {
+		return "", nil, fmt.Errorf("bitbucket pagination next %q does not match API host %s", next, base.Host)
+	}
+	path := u.EscapedPath()
+	// Requests are built as baseURL+path, so a base URL with a path prefix must not repeat it.
+	if prefix := strings.TrimRight(base.EscapedPath(), "/"); prefix != "" {
+		path = strings.TrimPrefix(path, prefix)
+	}
+	return path, u.Query(), nil
+}
+
 func giteaPaged[T any](ctx context.Context, c *restClient, path string) ([]T, error) {
 	var all []T
 	const limit = 50

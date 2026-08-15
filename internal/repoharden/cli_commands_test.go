@@ -278,13 +278,14 @@ func TestExitCodePlumbing(t *testing.T) {
 		{"harden --exit-code", 2, ""},
 		{"audit --fail-below 0", 2, ""},
 		{"audit --fail-below 150", 2, ""},
-		{"audit --provider bitbucket", 2, ""},
+		{"audit --provider bogusforge", 2, ""},
+		{"audit --provider bitbucket", 1, ""},
 	}
 	for _, c := range cases {
 		cmd := exec.Command(os.Args[0], "-test.run", "TestMainExitHelper")
 		cmd.Env = append(os.Environ(),
 			"REPO_HARDEN_MAIN_ARGS="+c.args,
-			"GITHUB_TOKEN=", "GH_TOKEN=", "NO_COLOR=1")
+			"GITHUB_TOKEN=", "GH_TOKEN=", "BITBUCKET_TOKEN=", "NO_COLOR=1")
 		out, err := cmd.Output()
 		code := 0
 		var ee *exec.ExitError
