@@ -1,12 +1,12 @@
 module github.com/26zl/repo-harden
 
-go 1.25.13
+go 1.26.0
 
 require (
-	github.com/cli/go-gh/v2 v2.13.0
+	github.com/cli/go-gh/v2 v2.16.0
 	github.com/gofrs/flock v0.13.1
 	github.com/google/go-github/v88 v88.0.0
-	golang.org/x/sync v0.22.0
+	golang.org/x/sync v0.23.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
