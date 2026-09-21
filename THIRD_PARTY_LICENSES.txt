@@ -6,7 +6,7 @@ binaries. repo-harden itself is licensed separately under the repository's
 LICENSE file.
 
 ==============================================================================
-github.com/cli/go-gh/v2 v2.13.0
+github.com/cli/go-gh/v2 v2.16.0
 ==============================================================================
 
 MIT License
@@ -62,7 +62,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ==============================================================================
-github.com/gofrs/flock v0.13.0
+github.com/gofrs/flock v0.13.1
 ==============================================================================
 
 Copyright (c) 2018-2025, The Gofrs
@@ -159,7 +159,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ==============================================================================
-Go standard library 1.25.13; golang.org/x/sync v0.22.0; golang.org/x/sys v0.44.0
+Go standard library 1.26.8; golang.org/x/sync v0.23.0; golang.org/x/sys v0.47.0
 ==============================================================================
 
 Copyright 2009 The Go Authors.
