@@ -1,6 +1,6 @@
 module github.com/26zl/repo-harden
 
-go 1.26.0
+go 1.26.8
 
 require (
 	github.com/cli/go-gh/v2 v2.16.0
