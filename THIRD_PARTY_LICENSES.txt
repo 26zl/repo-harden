@@ -6,7 +6,7 @@ binaries. repo-harden itself is licensed separately under the repository's
 LICENSE file.
 
 ==============================================================================
-github.com/cli/go-gh/v2 v2.16.0
+github.com/cli/go-gh/v2 v2.16.1
 ==============================================================================
 
 MIT License
