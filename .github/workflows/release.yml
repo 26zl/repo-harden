@@ -76,7 +76,7 @@ jobs:
           go_version=$(go env GOVERSION)
           grep -Fq "Go standard library ${go_version#go}" THIRD_PARTY_LICENSES.txt
       - name: GoReleaser config
-        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
         with:
           version: "2.17.1"
           args: check
@@ -109,7 +109,7 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP/syft-bin" syft
           echo "$RUNNER_TEMP/syft-bin" >> "$GITHUB_PATH"
       - name: Build release artifacts without publishing
-        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
         with:
           version: "2.17.1"
           args: release --clean --skip=publish
