@@ -3,7 +3,7 @@ module github.com/26zl/repo-harden
 go 1.26.10
 
 require (
-	github.com/cli/go-gh/v2 v2.16.2
+	github.com/cli/go-gh/v2 v2.17.0
 	github.com/gofrs/flock v0.13.1
 	github.com/google/go-github/v88 v88.0.0
 	golang.org/x/sync v0.24.0
@@ -14,5 +14,5 @@ require (
 	github.com/cli/safeexec v1.0.1 // indirect
 	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
-	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
 )
