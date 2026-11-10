@@ -6,7 +6,7 @@ require (
 	github.com/cli/go-gh/v2 v2.17.0
 	github.com/gofrs/flock v0.13.1
 	github.com/google/go-github/v88 v88.0.0
-	golang.org/x/sync v0.24.0
+	golang.org/x/sync v0.25.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
